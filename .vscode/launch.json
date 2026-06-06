@@ -1,0 +1,24 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "hello_world (defaults)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/hello_world.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python"
+    },
+    {
+      "name": "hello_world (prompt args)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/hello_world.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "args": ["--prompt", "disco funk", "--seconds", "4", "--out", "out.wav"]
+    }
+  ]
+}
