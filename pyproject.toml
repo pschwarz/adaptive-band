@@ -1,0 +1,12 @@
+[project]
+name = "adaptive-band"
+version = "0.1.0"
+description = "Magenta RealTime 2 experiments"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "magenta-rt[mlx]",
+]
+
+[tool.uv]
+# magenta-rt is published on PyPI as `magenta-rt`; the [mlx] extra pulls the
+# Apple Silicon backend.
