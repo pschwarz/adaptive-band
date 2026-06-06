@@ -19,6 +19,26 @@
       "cwd": "${workspaceFolder}",
       "python": "${workspaceFolder}/.venv/bin/python",
       "args": ["--prompt", "disco funk", "--seconds", "4", "--out", "out.wav"]
+    },
+    {
+      "name": "hello_world (play)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/hello_world.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "args": ["--prompt", "disco funk", "--seconds", "4", "--play"]
+    },
+    {
+      "name": "hello_world (stream)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/hello_world.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "args": ["--prompt", "disco funk", "--stream"]
     }
   ]
 }

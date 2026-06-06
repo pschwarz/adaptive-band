@@ -5,6 +5,7 @@ description = "Magenta RealTime 2 experiments"
 requires-python = ">=3.11,<3.13"
 dependencies = [
     "magenta-rt[mlx]",
+    "sounddevice",  # direct speaker playback (--play)
 ]
 
 [tool.uv]
