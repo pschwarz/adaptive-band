@@ -39,6 +39,16 @@
       "cwd": "${workspaceFolder}",
       "python": "${workspaceFolder}/.venv/bin/python",
       "args": ["--prompt", "disco funk", "--stream"]
+    },
+    {
+      "name": "hello_world (tempo + stream)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/hello_world.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "args": ["--prompt", "disco funk", "--tempo", "120", "--stream"]
     }
   ]
 }
