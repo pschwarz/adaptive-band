@@ -37,18 +37,18 @@ drains it. The few-chunk lead buffer keeps the device fed so it never starves be
 `generate()` calls — generation is ~0.6s per 1s of audio on M4 Max, so playback is gapless.
 (Serializing generate → write instead caused an audible seam every chunk.)
 
-### Tempo
+### Tempo & time signature
 
-`--tempo` (BPM, default 100) nudges the generated tempo:
+`--tempo` (BPM, default 100) and `--time-sig` (`4/4`, `3/4`, or `6/8`) nudge the rhythm:
 
 ```bash
-uv run python hello_world.py --prompt "disco funk" --tempo 120 --stream
+uv run python hello_world.py --prompt "waltz" --tempo 120 --time-sig 3/4 --stream
 ```
 
-MRT2 has **no numeric tempo input** — its only conditioning is the text style prompt (plus
-notes/drums). So `--tempo` is a *soft hint*: it appends a tempo word + the BPM to the prompt
-(e.g. `"disco funk, upbeat tempo, 120 BPM"`) before embedding. It influences feel but does
-not lock the tempo.
+MRT2 has **no numeric tempo or time-signature input** — its only conditioning is the text
+style prompt (plus notes/drums). So both are *soft hints*: they append a tempo word + BPM
+(and the time signature, if given) to the prompt — e.g. `"waltz, upbeat tempo, 120 BPM,
+3/4 time"` — before embedding. They influence feel but do not lock tempo or meter.
 
 Uses `MagentaRT2SystemMlxfn`, which loads the already-exported `.mlxfn` weights with no
 network access. Output is 48 kHz stereo WAV.

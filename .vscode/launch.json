@@ -48,7 +48,17 @@
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}",
       "python": "${workspaceFolder}/.venv/bin/python",
-      "args": ["--prompt", "disco funk", "--tempo", "120", "--stream"]
+      "args": ["--prompt", "texas blues", "--tempo", "60", "--stream"]
+    },
+    {
+      "name": "hello_world (tempo + time-sig + stream)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/hello_world.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "args": ["--prompt", "waltz", "--tempo", "120", "--time-sig", "3/4", "--stream"]
     }
   ]
 }

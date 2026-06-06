@@ -24,11 +24,18 @@ def tempo_word(bpm):
     return "fast tempo"
 
 
-def prompt_with_tempo(prompt, bpm):
-    """MRT2 has no numeric tempo input; the only lever is the text style prompt.
-    Inject both a tempo word and the BPM number as a soft hint to MusicCoCa."""
+TIME_SIGS = ("4/4", "3/4", "6/8")
+
+
+def prompt_with_tempo(prompt, bpm, time_sig=None):
+    """MRT2 has no numeric tempo or time-signature input; the only lever is the
+    text style prompt. Inject a tempo word + BPM (and time signature, if given)
+    as a soft hint to MusicCoCa."""
     n = int(bpm) if float(bpm).is_integer() else bpm  # "100 BPM" not "100.0 BPM"
-    return f"{prompt}, {tempo_word(bpm)}, {n} BPM"
+    hint = f"{prompt}, {tempo_word(bpm)}, {n} BPM"
+    if time_sig:
+        hint += f", {time_sig} time"
+    return hint
 
 
 def stream_forever(mrt, embedding, chunk_frames=25, lead_chunks=3):
@@ -107,6 +114,7 @@ def main():
     p.add_argument("--size", default="mrt2_base")  # 2.4B: full quality, real-time on M4 Max
     p.add_argument("--out", default="out.wav")
     p.add_argument("--tempo", type=float, default=100.0, help="target tempo in BPM (soft hint injected into the prompt; MRT2 has no hard tempo control)")
+    p.add_argument("--time-sig", choices=TIME_SIGS, default=None, help="time signature hint injected into the prompt (soft; MRT2 has no hard time-signature control)")
     p.add_argument("--play", action="store_true", help="play to speakers instead of writing a file (Ctrl+C to stop)")
     p.add_argument("--stream", action="store_true", help="generate + play continuously until Ctrl+C")
     args = p.parse_args()
@@ -114,7 +122,7 @@ def main():
     print(f"Loading {args.size} from exported .mlxfn (no download)...")
     mrt = MagentaRT2SystemMlxfn(size=args.size)
 
-    effective_prompt = prompt_with_tempo(args.prompt, args.tempo)
+    effective_prompt = prompt_with_tempo(args.prompt, args.tempo, args.time_sig)
     print(f"Embedding prompt: {effective_prompt!r}")
     embedding = mrt.embed_style(effective_prompt)
 
