@@ -38,7 +38,7 @@ def prompt_with_tempo(prompt, bpm, time_sig=None):
     return hint
 
 
-def stream_forever(mrt, embedding, chunk_frames=25, lead_chunks=3):
+def stream_forever(mrt, embedding, chunk_frames=25, lead_chunks=3, drums=None):
     """Generate ~1s chunks back-to-back, threading state forward, and stream them
     to the speakers gaplessly until Ctrl+C.
 
@@ -58,7 +58,7 @@ def stream_forever(mrt, embedding, chunk_frames=25, lead_chunks=3):
     import sounddevice as sd
 
     # Prime first chunk to learn sample rate + channel count.
-    wav, state = mrt.generate(style=embedding, frames=chunk_frames)
+    wav, state = mrt.generate(style=embedding, frames=chunk_frames, drums=drums)
     sample_rate, channels = wav.sample_rate, wav.num_channels
 
     chunks: queue.Queue = queue.Queue(maxsize=lead_chunks)  # bounded => backpressure
@@ -85,7 +85,7 @@ def stream_forever(mrt, embedding, chunk_frames=25, lead_chunks=3):
 
     # Pre-roll a cushion on this thread before opening the device.
     while chunks.qsize() < lead_chunks:
-        wav, state = mrt.generate(style=embedding, frames=chunk_frames, state=state)
+        wav, state = mrt.generate(style=embedding, frames=chunk_frames, state=state, drums=drums)
         chunks.put(np.ascontiguousarray(wav.samples, dtype=np.float32))
 
     stream = sd.OutputStream(
@@ -98,7 +98,7 @@ def stream_forever(mrt, embedding, chunk_frames=25, lead_chunks=3):
         # Keep generating on the main thread; the bounded queue's blocking put
         # paces us to playback rate (backpressure), and the callback drains it.
         while True:
-            wav, state = mrt.generate(style=embedding, frames=chunk_frames, state=state)
+            wav, state = mrt.generate(style=embedding, frames=chunk_frames, state=state, drums=drums)
             chunks.put(np.ascontiguousarray(wav.samples, dtype=np.float32))
     except KeyboardInterrupt:
         print("\nStopped.")
@@ -115,6 +115,7 @@ def main():
     p.add_argument("--out", default="out.wav")
     p.add_argument("--tempo", type=float, default=100.0, help="target tempo in BPM (soft hint injected into the prompt; MRT2 has no hard tempo control)")
     p.add_argument("--time-sig", choices=TIME_SIGS, default=None, help="time signature hint injected into the prompt (soft; MRT2 has no hard time-signature control)")
+    p.add_argument("--drums", action="store_true", help="set the drums conditioning to 1 (bias toward percussion); soft, not timed")
     p.add_argument("--play", action="store_true", help="play to speakers instead of writing a file (Ctrl+C to stop)")
     p.add_argument("--stream", action="store_true", help="generate + play continuously until Ctrl+C")
     args = p.parse_args()
@@ -126,13 +127,15 @@ def main():
     print(f"Embedding prompt: {effective_prompt!r}")
     embedding = mrt.embed_style(effective_prompt)
 
+    drums = [1] if args.drums else None  # API wants a length-1 list; None = masked
+
     if args.stream:
-        stream_forever(mrt, embedding)
+        stream_forever(mrt, embedding, drums=drums)
         return
 
     frames = round(args.seconds * 25)  # 25 frames == 1 second
     print(f"Generating ~{args.seconds}s ({frames} frames)...")
-    wav, _state = mrt.generate(style=embedding, frames=frames)
+    wav, _state = mrt.generate(style=embedding, frames=frames, drums=drums)
 
     if args.play:
         import sounddevice as sd
