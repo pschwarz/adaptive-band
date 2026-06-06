@@ -69,6 +69,16 @@
       "cwd": "${workspaceFolder}",
       "python": "${workspaceFolder}/.venv/bin/python",
       "args": ["--prompt", "disco funk", "--tempo", "80", "--time-sig", "3/4", "--drums", "--stream"]
+    },
+    {
+      "name": "hello_world (beat-sync)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/hello_world.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "args": ["--prompt", "funk", "--tempo", "100", "--time-sig", "4/4", "--beat-sync"]
     }
   ]
 }
