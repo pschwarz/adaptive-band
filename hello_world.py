@@ -13,6 +13,24 @@ import time
 from magenta_rt.mlx.system import MagentaRT2SystemMlxfn
 
 
+def tempo_word(bpm):
+    """Coarse tempo descriptor for the style prompt."""
+    if bpm <= 70:
+        return "slow tempo"
+    if bpm <= 110:
+        return "medium tempo"
+    if bpm <= 140:
+        return "upbeat tempo"
+    return "fast tempo"
+
+
+def prompt_with_tempo(prompt, bpm):
+    """MRT2 has no numeric tempo input; the only lever is the text style prompt.
+    Inject both a tempo word and the BPM number as a soft hint to MusicCoCa."""
+    n = int(bpm) if float(bpm).is_integer() else bpm  # "100 BPM" not "100.0 BPM"
+    return f"{prompt}, {tempo_word(bpm)}, {n} BPM"
+
+
 def stream_forever(mrt, embedding, chunk_frames=25, lead_chunks=3):
     """Generate ~1s chunks back-to-back, threading state forward, and stream them
     to the speakers gaplessly until Ctrl+C.
@@ -88,6 +106,7 @@ def main():
     p.add_argument("--seconds", type=float, default=12.0)
     p.add_argument("--size", default="mrt2_base")  # 2.4B: full quality, real-time on M4 Max
     p.add_argument("--out", default="out.wav")
+    p.add_argument("--tempo", type=float, default=100.0, help="target tempo in BPM (soft hint injected into the prompt; MRT2 has no hard tempo control)")
     p.add_argument("--play", action="store_true", help="play to speakers instead of writing a file (Ctrl+C to stop)")
     p.add_argument("--stream", action="store_true", help="generate + play continuously until Ctrl+C")
     args = p.parse_args()
@@ -95,8 +114,9 @@ def main():
     print(f"Loading {args.size} from exported .mlxfn (no download)...")
     mrt = MagentaRT2SystemMlxfn(size=args.size)
 
-    print(f"Embedding prompt: {args.prompt!r}")
-    embedding = mrt.embed_style(args.prompt)
+    effective_prompt = prompt_with_tempo(args.prompt, args.tempo)
+    print(f"Embedding prompt: {effective_prompt!r}")
+    embedding = mrt.embed_style(effective_prompt)
 
     if args.stream:
         stream_forever(mrt, embedding)
