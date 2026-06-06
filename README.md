@@ -14,59 +14,38 @@ uv venv --python 3.12
 uv pip install "magenta-rt[mlx]"
 ```
 
-## Hello world
+## Run it
 
-Generate audio from a text prompt:
-
-```bash
-uv run python hello_world.py --prompt "disco funk" --seconds 4 --out out.wav
-afplay out.wav
-```
-
-Or play live to the speakers:
+Beat-synced live stream from a text prompt (Ctrl+C to stop):
 
 ```bash
-uv run python hello_world.py --prompt "disco funk" --seconds 4 --play   # fixed-length
-uv run python hello_world.py --prompt "disco funk" --stream             # endless, Ctrl+C to stop
+uv run python hello_world.py --prompt "blues" --tempo 100 --time-sig 4/4
 ```
 
-`--stream` generates ~1s chunks back-to-back, threading the model's state forward so the
-music stays coherent. Generation runs on the main thread (the imported `.mlxfn` is bound to
-the thread that loaded it) and fills a small bounded queue; PortAudio's audio callback
-drains it. The few-chunk lead buffer keeps the device fed so it never starves between
-`generate()` calls — generation is ~0.6s per 1s of audio on M4 Max, so playback is gapless.
-(Serializing generate → write instead caused an audible seam every chunk.)
+Args: `--prompt`, `--tempo` (BPM, default 100), `--time-sig` (`4/4`, `3/4`, or `6/8`,
+default `4/4`), `--size` (default `mrt2_base`). Output is 48 kHz stereo to the speakers.
 
-### Tempo & time signature
+### How it streams
 
-`--tempo` (BPM, default 100) and `--time-sig` (`4/4`, `3/4`, or `6/8`) nudge the rhythm:
+Generation runs on the main thread (the imported `.mlxfn` is bound to the thread that loaded
+it) and fills a queue; PortAudio's audio callback drains it. A ~1.5s lead buffer keeps the
+device fed so it never starves between `generate()` calls — generation is ~0.6s per 1s of
+audio on M4 Max, so playback is gapless.
 
-```bash
-uv run python hello_world.py --prompt "waltz" --tempo 120 --time-sig 3/4 --stream
-```
+### Beat sync
 
-MRT2 has **no numeric tempo or time-signature input** — its only conditioning is the text
-style prompt (plus notes/drums). So both are *soft hints*: they append a tempo word + BPM
-(and the time signature, if given) to the prompt — e.g. `"waltz, upbeat tempo, 120 BPM,
-3/4 time"` — before embedding. They influence feel but do not lock tempo or meter.
+The stream is generated **one beat at a time** (each beat's length in 40ms frames derived
+from `--tempo`), setting the model's `drums` conditioning to *play* only on **backbeat**
+beats — 2 & 4 in `4/4`, 2 & 3 in `3/4`, beat 2 in `6/8`. Each backbeat is split into a
+1-frame drum *onset* plus a tail, placing the hit at the start of the beat. A fractional-frame
+accumulator carries the rounding remainder across beats, so the **average** tempo stays locked
+even though each beat snaps to the 40ms grid (individual beats jitter ±~20ms).
 
-### Beat-synced drums
+This is the `drums` channel — a *soft* bias toward grid-aligned hits, not a sample-exact
+metronome click, and the model may add its own off-grid percussion. It's the finest rhythmic
+control the API exposes (MRT2 takes no audio/click input).
 
-`--beat-sync` drives an actual rhythm instead of just hinting one. It generates **one beat
-at a time** (deriving each beat's length in 40ms frames from `--tempo`) and sets the model's
-`drums` conditioning to *play* only on **backbeat** beats — 2 & 4 in `4/4`, 2 & 3 in `3/4`,
-beat 2 in `6/8`. Implies streaming; Ctrl+C to stop.
-
-```bash
-uv run python hello_world.py --prompt "funk" --tempo 100 --time-sig 4/4 --beat-sync
-```
-
-Each backbeat is split into a 1-frame drum *onset* plus a tail, placing the hit at the start
-of the beat. A fractional-frame accumulator carries the rounding remainder across beats, so
-the **average** tempo stays locked even though each beat snaps to the 40ms grid (individual
-beats jitter ±~20ms). This is still the `drums` channel — a *soft* bias toward grid-aligned
-hits, not a sample-exact metronome click, and the model may add its own off-grid percussion.
-It's the finest rhythmic control the API exposes (MRT2 takes no audio/click input).
-
-Uses `MagentaRT2SystemMlxfn`, which loads the already-exported `.mlxfn` weights with no
-network access. Output is 48 kHz stereo WAV.
+`--tempo` and `--time-sig` also feed a text hint into the prompt — e.g. `"blues, medium
+tempo, 100 BPM, 4/4 time"` — since MRT2 has **no numeric tempo or time-signature input**; its
+only conditioning is the style prompt (plus notes/drums). The prompt hint and the beat grid
+reinforce each other.

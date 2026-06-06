@@ -1,84 +1,26 @@
 {
   "version": "0.2.0",
   "configurations": [
+
     {
-      "name": "hello_world (defaults)",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/hello_world.py",
-      "console": "integratedTerminal",
-      "cwd": "${workspaceFolder}",
-      "python": "${workspaceFolder}/.venv/bin/python"
-    },
-    {
-      "name": "hello_world (prompt args)",
+      "name": "hello_world (blues 4/4)",
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/hello_world.py",
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}",
       "python": "${workspaceFolder}/.venv/bin/python",
-      "args": ["--prompt", "disco funk", "--seconds", "4", "--out", "out.wav"]
+      "args": ["--prompt", "texas blues backing band, piano, rhythm guitar", "--tempo", "100", "--time-sig", "4/4"]
     },
     {
-      "name": "hello_world (play)",
+      "name": "hello_world (waltz 3/4)",
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/hello_world.py",
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}",
       "python": "${workspaceFolder}/.venv/bin/python",
-      "args": ["--prompt", "disco funk", "--seconds", "4", "--play"]
-    },
-    {
-      "name": "hello_world (stream)",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/hello_world.py",
-      "console": "integratedTerminal",
-      "cwd": "${workspaceFolder}",
-      "python": "${workspaceFolder}/.venv/bin/python",
-      "args": ["--prompt", "disco funk", "--stream"]
-    },
-    {
-      "name": "hello_world (tempo + stream)",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/hello_world.py",
-      "console": "integratedTerminal",
-      "cwd": "${workspaceFolder}",
-      "python": "${workspaceFolder}/.venv/bin/python",
-      "args": ["--prompt", "texas blues", "--tempo", "60", "--stream"]
-    },
-    {
-      "name": "hello_world (tempo + time-sig + stream)",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/hello_world.py",
-      "console": "integratedTerminal",
-      "cwd": "${workspaceFolder}",
-      "python": "${workspaceFolder}/.venv/bin/python",
-      "args": ["--prompt", "waltz", "--tempo", "120", "--time-sig", "3/4", "--stream"]
-    },
-    {
-      "name": "hello_world (drums + stream)",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/hello_world.py",
-      "console": "integratedTerminal",
-      "cwd": "${workspaceFolder}",
-      "python": "${workspaceFolder}/.venv/bin/python",
-      "args": ["--prompt", "disco funk", "--tempo", "80", "--time-sig", "3/4", "--drums", "--stream"]
-    },
-    {
-      "name": "hello_world (beat-sync)",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/hello_world.py",
-      "console": "integratedTerminal",
-      "cwd": "${workspaceFolder}",
-      "python": "${workspaceFolder}/.venv/bin/python",
-      "args": ["--prompt", "funk", "--tempo", "100", "--time-sig", "4/4", "--beat-sync"]
+      "args": ["--prompt", "waltz", "--tempo", "120", "--time-sig", "3/4"]
     }
   ]
 }
