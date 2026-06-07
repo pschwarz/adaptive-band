@@ -1,6 +1,6 @@
 """Staged backing band on top of Magenta RealTime 2 (MRT2).
 
-A different interaction model from hello_world.py's continuous open-loop stream.
+A different interaction model from a continuous open-loop stream.
 Here the app runs in stages:
 
   1. Drums + tempo start and never drop out.
@@ -13,10 +13,9 @@ v1 is the one-shot pipeline (drums -> learn -> generate -> loop). The north star
 is continuous re-learning (a living jam partner) and, later, gesture cues
 (a camera "nod" -> new progression for verse/chorus) -- both out of scope here.
 
-This module is a NEW entry point and does NOT modify hello_world.py; it imports
-the reusable pieces (beat grid, input capture, pitch front-end, key estimator,
-device resolvers, the MRT2 loader) and adds chord detection + a progression-driven
-playback loop.
+This is the app's entry point; it imports the reusable pieces from mrt_core
+(beat grid, input capture, pitch front-end, key estimator, device resolvers, the
+MRT2 loader) and adds chord detection + a progression-driven playback loop.
 
 MRT2 has no symbolic chord input. The only pitch lever is generate(notes=<128 ints>),
 a per-MIDI-pitch state map (-1 masked / 0 off / 1 on / 2 onset / 3 on, model's
@@ -33,7 +32,7 @@ import threading
 import time
 import tty
 
-from hello_world import (
+from mrt_core import (
     BEAT_GRID,
     MODE_ALIASES,
     MODE_INTERVALS,
@@ -87,7 +86,7 @@ CHORD_QUALITIES = {
 # Per-chord-tone weights for the matching templates. Root + fifth are heaviest so
 # the matcher leans on the chord's skeleton (the third disambiguates quality but
 # is the tone most often masked by overtones/bleed), mirroring the tonic/fifth
-# emphasis of hello_world's key templates (_DEGREE_WEIGHT).
+# emphasis of mrt_core's key templates (_DEGREE_WEIGHT).
 _CHORD_TONE_WEIGHT = {0: 3.0, 7: 2.0}   # root, fifth (offset from chord root)
 _CHORD_DEFAULT_WEIGHT = 1.5             # third (and the #5 of an aug, etc.)
 
@@ -108,18 +107,6 @@ def chord_templates():
     return templates
 
 
-def match_chord(chroma12, templates):
-    """Mean chroma (12-vector) -> best-fitting (root, quality). Zero-means the
-    chroma and picks the template with the highest correlation."""
-    import numpy as np
-
-    c = np.asarray(chroma12, dtype=np.float64)
-    c = c - c.mean()
-    if not float(np.linalg.norm(c)):
-        return None
-    return max(templates, key=lambda k: float((c * templates[k]).sum()))
-
-
 def chord_mask(chord_root, chord_quality, key_root, key_mode):
     """(chord) + (stable key) -> 128-int notes vector for generate().
 
@@ -127,7 +114,7 @@ def chord_mask(chord_root, chord_quality, key_root, key_mode):
     onset/continuation), other in-key scale degrees = 1 (mild on), everything
     out of key = -1 (masked / "no opinion"). No hard 0 ("off") -- a continuous
     hard lock under the streaming state decays coherence within ~10s (see the
-    encoding note in hello_world.py). The chord leads; the key keeps the model
+    encoding note in mrt_core.py). The chord leads; the key keeps the model
     melodically free within the scale; chromatic tones are merely un-biased."""
     key_mode = MODE_ALIASES.get(key_mode, key_mode)
     chord_pcs = {(chord_root + off) % 12 for off in CHORD_QUALITIES[chord_quality]}
@@ -256,15 +243,6 @@ def chord_spans(progression, total_beats, beats_per_bar):
     return spans
 
 
-def phrase_prompt(band_prompt, bars):
-    """Build a whole-phrase style prompt naming the chord of every bar in order, e.g.
-    '<band prompt>, chord progression by bar: C major, A minor, F major, G major'.
-    `bars` is a list of (root, quality). MRT2 has no symbolic chord input, so this is
-    how we tell it the harmony for the whole N-bar phrase in one shot."""
-    seq = ", ".join(chord_prompt_phrase(r, q) for r, q in bars)
-    return f"{band_prompt}, chord progression by bar: {seq}"
-
-
 # --- Stage 2: learning ----------------------------------------------------
 
 def _beats_per_bar(time_sig):
@@ -352,41 +330,6 @@ def _crossfade_join(prev_tail, new_bar, fade_len):
     fade_in = np.sin(t * (np.pi / 2.0))[:, None]
     out[:fade_len] = prev_tail[-fade_len:] * fade_out + out[:fade_len] * fade_in
     return out
-
-
-def _summarize_notes(notes):
-    """Compact one-line summary of a 128-int notes mask (or None) for logging: the
-    full vector is too noisy, so we report which pitch classes are set to what level."""
-    if notes is None:
-        return "None"
-    if len(notes) <= 8:                     # short masks (e.g. drums [0]/[1]) print whole
-        return repr(list(notes))
-    levels = {}                             # level -> [pitch indices set to it]
-    for i, v in enumerate(notes):
-        if v != -1:                         # -1 == masked == default, skip the noise
-            levels.setdefault(int(v), []).append(i)
-    if not levels:
-        return f"all -1 (masked), len={len(notes)}"
-    parts = [f"={lvl}:{idxs}" for lvl, idxs in sorted(levels.items())]
-    return f"len={len(notes)} non-default[{', '.join(parts)}]"
-
-
-def _gen(mrt, tag, **kw):
-    """Log every parameter sent to mrt.generate(), then call it. `tag` labels the call
-    site (drums / backing span). All generation goes through here so the exact knobs
-    feeding Magenta are visible each time."""
-    fields = []
-    for k, v in kw.items():
-        if k == "style":
-            fields.append("style=<embedding>")
-        elif k == "notes":
-            fields.append(f"notes={_summarize_notes(v)}")
-        elif k == "state":
-            fields.append(f"state={'None' if v is None else '<carried>'}")
-        else:
-            fields.append(f"{k}={v}")
-    print(f"  [generate:{tag}] " + ", ".join(fields))
-    return mrt.generate(**kw)
 
 
 def make_drum_loop(mrt, bpm, time_sig, bars, cfg_musiccoca=None,
@@ -979,7 +922,7 @@ def _beat_chroma(capture, bpm, min_seconds=1.6):
     too-short slice gets left-padded with silence and the chord barely registers).
     A ~1.6s trailing slice keeps the current chord's tones present while staying
     dominated by the most recent playing. Reads capture._buf directly so we don't
-    modify hello_world.py."""
+    modify mrt_core.py."""
     import numpy as np
 
     # Ring buffer: the write head is _pos, so the chronological order is
@@ -1023,14 +966,14 @@ def _detect_repeat(roots):
     return L
 
 
-# --- Queued player (self-contained; modeled on hello_world.stream_beats) ---
+# --- Queued player (self-contained) ---
 
 class QueuedPlayer:
     """Decouples MLX generation (main thread) from PortAudio playback (its own
     callback thread) via a bounded queue, with a lead cushion sized in audio
     seconds. Generation must stay on the thread that imported the .mlxfn model, so
     callers push() generated wavs from the main thread and the audio callback only
-    memcpys -- the same thread discipline as hello_world.stream_beats."""
+    memcpys -- generation and playback never touch MLX on the same thread."""
 
     def __init__(self, lead_seconds=1.5, output_device=None, external=False):
         import queue

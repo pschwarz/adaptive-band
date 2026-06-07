@@ -33,7 +33,7 @@ sound you hear is exactly what the prompt produced (no seam-hiding, no layering)
 
 import argparse
 
-from hello_world import (
+from mrt_core import (
     BEAT_GRID,
     MagentaRT2SystemMlxfn,
     prompt_with_tempo,

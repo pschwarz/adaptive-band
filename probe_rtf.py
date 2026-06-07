@@ -11,7 +11,7 @@ Run: .venv/bin/python probe_rtf.py [--sizes mrt2_small mrt2_base] [--tempo 100]
 import argparse
 import time
 
-from hello_world import MagentaRT2SystemMlxfn
+from mrt_core import MagentaRT2SystemMlxfn
 from staged_band import _beat_frame_counts, _beats_per_bar
 
 

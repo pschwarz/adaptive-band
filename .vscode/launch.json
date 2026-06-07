@@ -11,7 +11,6 @@
       "python": "${workspaceFolder}/.venv/bin/python",
       "args": ["--generation-debug", "--prompt", "rock guitar", "--tempo", "100", "--time-sig", "4/4", "--chords", "C, C, C, C, F, F, C, C", "--temperature", "1.0"]
     },
-
     {
       "name": "staged_band (backing-only, --chords)",
       "type": "debugpy",
@@ -41,126 +40,6 @@
       "cwd": "${workspaceFolder}",
       "python": "${workspaceFolder}/.venv/bin/python",
       "args": ["--prompt", "rock guitar", "--tempo", "80", "--time-sig", "4/4", "--input-device", "iD4", "--input-channel", "1", "--output-device", "iD4", "--duplex", "--temperature", "0.90"]
-    },
-    {
-      "name": "hello_world (blues 4/4)",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/hello_world.py",
-      "console": "integratedTerminal",
-      "cwd": "${workspaceFolder}",
-      "python": "${workspaceFolder}/.venv/bin/python",
-      "args": ["--prompt", "texas blues backing band, piano, rhythm guitar", "--tempo", "100", "--time-sig", "4/4"]
-    },
-    {
-      "name": "hello_world (waltz 3/4)",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/hello_world.py",
-      "console": "integratedTerminal",
-      "cwd": "${workspaceFolder}",
-      "python": "${workspaceFolder}/.venv/bin/python",
-      "args": ["--prompt", "waltz", "--tempo", "120", "--time-sig", "3/4"]
-    },
-    {
-      "name": "hello_world (monitor input)",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/hello_world.py",
-      "console": "integratedTerminal",
-      "cwd": "${workspaceFolder}",
-      "python": "${workspaceFolder}/.venv/bin/python",
-      "args": ["--monitor", "--input-device", "iD4", "--input-channel", "1"]
-    },
-    {
-      "name": "hello_world (listen, follow key)",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/hello_world.py",
-      "console": "integratedTerminal",
-      "cwd": "${workspaceFolder}",
-      "python": "${workspaceFolder}/.venv/bin/python",
-      "args": ["--prompt", "jazz trio, piano", "--tempo", "100", "--listen", "--input-device", "iD4", "--input-channel", "1"]
-    },
-    {
-      "name": "hello_world (listen, basic-pitch)",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/hello_world.py",
-      "console": "integratedTerminal",
-      "cwd": "${workspaceFolder}",
-      "python": "${workspaceFolder}/.venv/bin/python",
-      "args": ["--prompt", "choir", "--tempo", "100", "--listen", "--estimator", "basic-pitch", "--listen-seconds", "6", "--input-device", "iD4", "--input-channel", "1", "--output-device", "External Headphones"]
-    },
-    {
-      "name": "hello_world (monitor, basic-pitch)",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/hello_world.py",
-      "console": "integratedTerminal",
-      "cwd": "${workspaceFolder}",
-      "python": "${workspaceFolder}/.venv/bin/python",
-      "args": ["--monitor", "--estimator", "basic-pitch", "--listen-seconds", "6", "--input-device", "iD4", "--input-channel", "1"]
-    },
-    {
-      "name": "hello_world (static C dorian)",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/hello_world.py",
-      "console": "integratedTerminal",
-      "cwd": "${workspaceFolder}",
-      "python": "${workspaceFolder}/.venv/bin/python",
-      "args": ["--prompt", "warm synth pads", "--tempo", "90", "--key", "C", "--mode", "dorian"]
-    },
-    {
-      "name": "coherence A: baseline (no fix)",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/hello_world.py",
-      "console": "integratedTerminal",
-      "cwd": "${workspaceFolder}",
-      "python": "${workspaceFolder}/.venv/bin/python",
-      "args": ["--prompt", "warm synth pads", "--tempo", "90", "--key", "C", "--mode", "dorian"]
-    },
-    {
-      "name": "coherence B: state reset 8s (seam)",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/hello_world.py",
-      "console": "integratedTerminal",
-      "cwd": "${workspaceFolder}",
-      "python": "${workspaceFolder}/.venv/bin/python",
-      "args": ["--prompt", "warm synth pads", "--tempo", "90", "--key", "C", "--mode", "dorian", "--reset-seconds", "8"]
-    },
-    {
-      "name": "coherence C: lower temp/top-k (no seam)",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/hello_world.py",
-      "console": "integratedTerminal",
-      "cwd": "${workspaceFolder}",
-      "python": "${workspaceFolder}/.venv/bin/python",
-      "args": ["--prompt", "warm synth pads", "--tempo", "90", "--key", "C", "--mode", "dorian", "--temperature", "1.0", "--top-k", "20"]
-    },
-    {
-      "name": "coherence D: stronger style (no seam)",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/hello_world.py",
-      "console": "integratedTerminal",
-      "cwd": "${workspaceFolder}",
-      "python": "${workspaceFolder}/.venv/bin/python",
-      "args": ["--prompt", "warm synth pads", "--tempo", "90", "--key", "C", "--mode", "dorian", "--style-strength", "5"]
-    },
-    {
-      "name": "coherence E: combined (no seam)",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/hello_world.py",
-      "console": "integratedTerminal",
-      "cwd": "${workspaceFolder}",
-      "python": "${workspaceFolder}/.venv/bin/python",
-      "args": ["--prompt", "warm synth pads", "--tempo", "90", "--key", "C", "--mode", "dorian", "--temperature", "1.0", "--top-k", "20", "--style-strength", "5"]
     }
   ]
 }
