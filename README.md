@@ -3,6 +3,9 @@
 Experiments with [Magenta RealTime 2](https://magenta.withgoogle.com/magenta-realtime-2)
 (MRT2) — Google's open-weights live music model — running natively on Apple Silicon via MLX.
 
+https://github.com/user-attachments/assets/8eae8ccf-4250-49fe-9105-f2ee7c5d2a2a
+
+
 ## Setup
 
 Requires [uv](https://docs.astral.sh/uv/) and an Apple Silicon Mac. Model weights are
