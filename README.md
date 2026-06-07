@@ -197,17 +197,21 @@ stay exact.
 progression (`make_backing_loop`) and looped **summed with the drums** (`LayeredFeeder`). MRT2 has
 no symbolic chord input. What shapes the sound:
 
-- **Chord-run granularity, state carried.** Consecutive bars on the same chord are collapsed
-  into one **run** (`chord_runs`), and each run is **one `generate()` call** with MRT `state`
-  carried run→run. A 2-bar held C is generated in one shot (the model phrases across the whole
-  held chord) rather than restarting each bar; carrying state keeps the next run continuous with
-  the last. Run→run seams are equal-power crossfaded (`_crossfade_join`), and the loop point is
-  folded with a lead-out run (`_crossfade_wrap`) — click-free.
+- **Per-chord-change takes, ≤6s each, state carried.** We've stopped reasoning bar-by-bar —
+  only chord **changes** matter. The progression is collapsed into chord **spans** measured in
+  beats (`chord_spans`), and each span gets **one `generate()` call** of `min(span, ~6s)`
+  (`BACKING_MAX_TAKE_SECONDS`), with MRT `state` carried span→span. A span that fits in ≤6s is
+  generated at its exact length; a chord held **longer** than 6s generates a single ~6s take and
+  **loops it** (crossfaded) to fill the span, rather than generating a long open-loop take that
+  drifts. Each take **starts on its chord-change beat boundary**; its internal pulse is left to
+  the model (tempo + time-sig in the prompt) — we don't re-generate or hard-align per beat.
+  Span→span seams are equal-power crossfaded (`_crossfade_join`); a long span's internal repeat
+  and the whole-loop point are both folded with a lead-out (`_crossfade_wrap`) — click-free.
 - **Root-only detection.** The backing only cares about each chord's **root**. Quality is
-  normalized to major in `chord_runs`, so a G major → G minor change is ignored (both sent as
-  plain "G") and same-root bars merge regardless of quality. This deliberately smooths the
-  backing for consistency — the kept harmony is just the run's root.
-- **Root in the prompt + a single-pitch notes mask.** The run's prompt names the root
+  normalized to major in `chord_spans`, so a G major → G minor change is ignored (both sent as
+  plain "G") and same-root beats merge regardless of quality. This deliberately smooths the
+  backing for consistency — the kept harmony is just the span's root.
+- **Root in the prompt + a single-pitch notes mask.** The span's prompt names the root
   (`bar_prompt` → `"<band prompt>, current chord: G major"`) and `notes = root_hint_mask(root)`
   marks the **one** root pitch class (`on=3`). The old graded chord+key mask (`chord_mask`,
   kept for reference) sounded bad; a lone root hint is a gentle cage, not a chord voicing.

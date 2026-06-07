@@ -52,14 +52,26 @@ from hello_world import (
 
 FPS = 25.0  # MRT2 generates at 25 frames/sec (40ms frames)
 
-# "Let the model breathe" defaults for the BACKING bake (make_backing_loop). The harmony
-# is anchored loosely on purpose: a faint style prompt + a single gentle root-note mask
-# hint + high sampling randomness. Applied only to the backing (NOT the drum bake); an
-# explicit --style-strength/--cfg-notes/--temperature/--top-k overrides per-knob.
-BACKING_CFG_MUSICCOCA = 0.1  # prompt = faint guide (model default 3.0)
-BACKING_CFG_NOTES = 1.0      # push the lone root-note hint firmly (model default ~0.1)
-BACKING_TEMPERATURE = 1.0    # (model default 1.3)
-BACKING_TOP_K = 103
+# Defaults for the BACKING bake (make_backing_loop) = Magenta's reference params (see
+# magenta_rt/mlx/generate.py). The earlier "let the model breathe" values (faint prompt +
+# wide top-k) sounded worse than the library examples; A/B confirmed the reference params.
+# Applied only to the backing (NOT the drum bake); explicit
+# --style-strength/--cfg-notes/--temperature/--top-k overrides per-knob.
+BACKING_CFG_MUSICCOCA = 3.0  # firm prompt guidance (Magenta default)
+BACKING_CFG_NOTES = 1.0      # push the lone root-note hint (Magenta default)
+BACKING_TEMPERATURE = 1.3    # Magenta default
+BACKING_TOP_K = 40           # Magenta default
+BACKING_MAX_TAKE_SECONDS = 6.0  # longest single backing take per chord; longer chords
+                                # loop this take (crossfaded) instead of generating more
+MRT2_FPS = 25.0                 # MRT2 generates 25 frames/sec (40ms frames); see beat_plan
+BACKING_ONSET_GRANULARITY = "beat"  # where the backing places note ONSETS so the model locks
+                                    # to tempo: "beat" = onset every beat (strong grid),
+                                    # "bar" = onset only on beat 1 of each bar (subtler)
+MIX_HEADROOM = 0.7              # fixed scale applied to BOTH layers when summing drums+backing,
+                                # so their sum stays within full-scale without a per-beat
+                                # limiter. A per-beat divide-by-peak would duck the drums only
+                                # on beats where the backing's onset clips -- an amplitude
+                                # wobble synced to the backing that reads as a groove change.
 
 # --- Chord vocabulary -----------------------------------------------------
 # Triads only for v1 (maj/min/dim/aug). Richer qualities (sevenths) are the job
@@ -222,28 +234,26 @@ def bar_chords(progression, total_beats, beats_per_bar):
             for bar in range(n_bars)]
 
 
-def chord_runs(progression, total_beats, beats_per_bar):
-    """Collapse the per-bar chord sequence into RUNS of consecutive identical chords.
-    bar_chords gives one (root,quality) per bar; here we merge adjacent equal bars into
-    (root, quality, n_bars). E.g. C,C,G,F -> [(C,maj,2),(G,maj,1),(F,maj,1)]. The baked
-    backing generates ONE generate() call per run (a 2-bar C in one shot rather than two
-    1-bar C's), so the model phrases across the whole held chord instead of restarting
-    each bar.
+def chord_spans(progression, total_beats, beats_per_bar):
+    """Collapse the progression into chord SPANS measured in BEATS: a list of
+    (root, quality, n_beats), merging adjacent equal-root beats into one span. Sum of
+    n_beats == total_beats.
 
-    ROOT-ONLY: the backing only cares about the chord's ROOT. Quality is normalized to
-    'maj' so a G major -> G minor change is ignored (both become plain "G") and adjacent
-    same-root bars merge into one run regardless of quality. This further smooths the
-    backing for consistency."""
-    bars = bar_chords(progression, total_beats, beats_per_bar)
-    runs = []
-    for root, _quality in bars:
+    This is the unit make_backing_loop generates over: one take per chord CHANGE, however
+    many beats the chord is held. Sampling per beat (via _chord_at_beat) means a chord that
+    changes mid-bar splits correctly. ROOT-ONLY: quality normalized to 'maj' so a
+    maj<->min on the same root doesn't split a span (the backing keys off the root; quality
+    rides in the prompt)."""
+    spans = []
+    for beat in range(total_beats):
+        root, _quality = _chord_at_beat(progression, beat, total_beats)
         quality = "maj"
-        if runs and runs[-1][0] == root:
-            r, q, n = runs[-1]
-            runs[-1] = (r, q, n + 1)
+        if spans and spans[-1][0] == root:
+            r, q, n = spans[-1]
+            spans[-1] = (r, q, n + 1)
         else:
-            runs.append((root, quality, 1))
-    return runs
+            spans.append((root, quality, 1))
+    return spans
 
 
 def phrase_prompt(band_prompt, bars):
@@ -344,8 +354,43 @@ def _crossfade_join(prev_tail, new_bar, fade_len):
     return out
 
 
-def make_drum_loop(mrt, bpm, time_sig, bars, cfg_musiccoca,
-                   temperature, top_k):
+def _summarize_notes(notes):
+    """Compact one-line summary of a 128-int notes mask (or None) for logging: the
+    full vector is too noisy, so we report which pitch classes are set to what level."""
+    if notes is None:
+        return "None"
+    if len(notes) <= 8:                     # short masks (e.g. drums [0]/[1]) print whole
+        return repr(list(notes))
+    levels = {}                             # level -> [pitch indices set to it]
+    for i, v in enumerate(notes):
+        if v != -1:                         # -1 == masked == default, skip the noise
+            levels.setdefault(int(v), []).append(i)
+    if not levels:
+        return f"all -1 (masked), len={len(notes)}"
+    parts = [f"={lvl}:{idxs}" for lvl, idxs in sorted(levels.items())]
+    return f"len={len(notes)} non-default[{', '.join(parts)}]"
+
+
+def _gen(mrt, tag, **kw):
+    """Log every parameter sent to mrt.generate(), then call it. `tag` labels the call
+    site (drums / backing span). All generation goes through here so the exact knobs
+    feeding Magenta are visible each time."""
+    fields = []
+    for k, v in kw.items():
+        if k == "style":
+            fields.append("style=<embedding>")
+        elif k == "notes":
+            fields.append(f"notes={_summarize_notes(v)}")
+        elif k == "state":
+            fields.append(f"state={'None' if v is None else '<carried>'}")
+        else:
+            fields.append(f"{k}={v}")
+    print(f"  [generate:{tag}] " + ", ".join(fields))
+    return mrt.generate(**kw)
+
+
+def make_drum_loop(mrt, bpm, time_sig, bars, cfg_musiccoca=None,
+                   temperature=None, top_k=None, return_clip=False):
     """Generate ONE fixed drum-only loop of `bars` bars, ONCE, and return it as a
     single contiguous sample buffer plus per-logical-beat sample offsets.
 
@@ -355,6 +400,12 @@ def make_drum_loop(mrt, bpm, time_sig, bars, cfg_musiccoca,
     is rock-steady and identical every bar. We embed a dedicated DRUMS-ONLY prompt
     (drum_prompt), NOT the band prompt, so no pitched instruments leak in.
 
+    The whole phrase is baked as ONE continuous _fn pass (_bake_drums_onsets) with a
+    per-FRAME drums-onset map -- a drum onset on each backbeat's first frame, masked
+    (model's choice) elsewhere -- not one generate() per beat. This is the same
+    onset-driven, single-pass approach the backing uses (_bake_take_onsets), so the
+    groove locks tempo/meter without per-beat restart artifacts.
+
     Seamless wrap: we bake one EXTRA bar past the loop as a "lead-out" (the model's
     natural continuation), then crossfade that lead-out back over the loop's head
     (_crossfade_wrap) so jumping from the last beat to the first has no pop.
@@ -363,45 +414,46 @@ def make_drum_loop(mrt, bpm, time_sig, bars, cfg_musiccoca,
     (N, channels) float32 array, and beat_offsets is a list of (start, end) sample
     indices for each logical beat in the loop (len == bars * beats_per_bar). The
     last beat's end == N, so concatenating all slices reproduces the loop exactly
-    and wrapping from the last beat back to the first is seamless."""
+    and wrapping from the last beat back to the first is seamless. With return_clip,
+    also returns the raw baked take (loop + lead-out, pre-wrap) for --generation-debug."""
     import numpy as np
 
-    beats = logical_beats(bpm, time_sig)
     bpb = _beats_per_bar(time_sig)
     total_beats = bars * bpb
     leadout_beats = bpb  # one extra bar, baked then folded into the head as a fade
+    gen_beats = total_beats + leadout_beats
 
-    embedding = mrt.embed_style(drum_prompt(bpm, time_sig))
+    _dprompt = drum_prompt(bpm, time_sig)
+    print(f"  [embed:drums] prompt={_dprompt!r}")
+    style_tokens = mrt.tokenize_style(mrt.embed_style(_dprompt)).tolist()
 
-    state = None
-    parts = []
-    beat_offsets = []
-    cursor = 0
-    sample_rate = channels = None
+    # Backbeat onset frames + per-beat frame bounds over the whole bake (loop + lead-out).
+    onset_frames, beat_bounds = _drum_onset_frame_plan(bpm, time_sig, gen_beats)
+    total_frames = beat_bounds[-1][1]
+    print(f"  [generate:drums] frames={total_frames}, onsets={len(onset_frames)}, "
+          f"state=None, drums=[1]@backbeats/[-1]else, notes=masked, "
+          f"cfg_musiccoca={cfg_musiccoca}, temperature={temperature}, top_k={top_k}")
+    t0 = time.time()
+    take, _state, sample_rate, channels = _bake_drums_onsets(
+        mrt, style_tokens, total_frames, onset_frames, None,
+        cfg_musiccoca, temperature, top_k)
+    print(f"  [drums] {bars}-bar loop gen {time.time() - t0:.2f}s")
 
-    for b in range(total_beats + leadout_beats):
-        chunks, _bar_start = next(beats)
-        start = cursor
-        for frames, drums in chunks:
-            wav, state = mrt.generate(style=embedding, frames=frames, state=state,
-                                      drums=drums, notes=None, cfg_musiccoca=cfg_musiccoca,
-                                      temperature=temperature, top_k=top_k)
-            s = np.ascontiguousarray(wav.samples, dtype=np.float32)
-            parts.append(s)
-            cursor += s.shape[0]
-            if sample_rate is None:
-                sample_rate, channels = wav.sample_rate, wav.num_channels
-        if b < total_beats:
-            beat_offsets.append((start, cursor))
-
-    full = np.concatenate(parts, axis=0)
-    loop_len = beat_offsets[-1][1]          # samples up to the loop point
-    fade_len = full.shape[0] - loop_len     # the baked lead-out length
+    spf = take.shape[0] / total_frames       # samples per frame (~1920 @48k)
+    # True per-loop-beat sample bounds (exclude the lead-out beats). Rebuild contiguously so
+    # rounding can't leave a gap: each beat ends where the next starts, last ends at loop_len.
+    starts = [round(s * spf) for s, _e in beat_bounds[:total_beats]]
+    loop_len = round(beat_bounds[total_beats - 1][1] * spf)
+    beat_offsets = [(starts[i], starts[i + 1] if i + 1 < len(starts) else loop_len)
+                    for i in range(len(starts))]
+    fade_len = take.shape[0] - loop_len      # the baked lead-out length
     # Cap the crossfade so it never bleeds past the first beat (keeps beat_offsets
     # valid: only samples inside beat 0 are altered).
     fade_len = min(fade_len, beat_offsets[0][1])
-    trimmed = full[:loop_len + fade_len]
+    trimmed = take[:loop_len + fade_len]
     samples = _crossfade_wrap(trimmed, fade_len)
+    if return_clip:
+        return samples, sample_rate, channels, beat_offsets, take
     return samples, sample_rate, channels, beat_offsets
 
 
@@ -436,8 +488,8 @@ class DrumLoopFeeder:
 
 def bar_prompt(band_prompt, root, quality):
     """Single-bar style prompt naming one chord, e.g. '<band prompt>, current chord:
-    C major'. make_backing_loop embeds this per chord-run so the prompt carries the
-    run's chord QUALITY (the root-note mask can't encode maj/min)."""
+    C major'. make_backing_loop embeds this per chord SPAN so the prompt carries the
+    span's chord QUALITY (the root-note mask can't encode maj/min)."""
     return f"{band_prompt}, current chord: {chord_prompt_phrase(root, quality)}"
 
 
@@ -464,126 +516,361 @@ def _beat_frame_counts(bpm, time_sig, n_beats):
     return counts
 
 
-def make_backing_loop(mrt, band_prompt, bpm, time_sig, progression, key,
+def _take_beats(bpm, time_sig, span_beats, max_seconds):
+    """How many of a span's leading beats fit in max_seconds of generated audio (>=1,
+    <= span_beats). Frames -> seconds at MRT2_FPS. This is the per-chord take length we
+    actually generate; a chord held longer than this loops the take instead of generating
+    more. Always returns >=1 so even a very fast tempo yields a real take."""
+    frames = _beat_frame_counts(bpm, time_sig, span_beats)
+    acc = 0
+    n = 0
+    for bf in frames:
+        if n >= 1 and (acc + bf) / MRT2_FPS > max_seconds:
+            break
+        acc += bf
+        n += 1
+    return n
+
+
+def _onset_frame_plan(bpm, time_sig, n_beats, granularity):
+    """Per-FRAME onset plan for a take of n_beats. Returns (onset_frames, beat_bounds):
+    onset_frames is a set of frame indices that should carry a note ONSET (the first frame
+    of each onset-bearing beat); beat_bounds is [(start_frame, end_frame), ...] per beat.
+    granularity "beat" -> every beat's first frame; "bar" -> only beat 1 of each bar."""
+    bpb = _beats_per_bar(time_sig)
+    counts = _beat_frame_counts(bpm, time_sig, n_beats)
+    onset_frames = set()
+    beat_bounds = []
+    f = 0
+    for k, n in enumerate(counts):
+        if (granularity != "bar") or (k % bpb == 0):
+            onset_frames.add(f)
+        beat_bounds.append((f, f + n))
+        f += n
+    return onset_frames, beat_bounds
+
+
+def _bake_take_onsets(mrt, style_tokens, root, total_frames, onset_frames, state,
                       cfg_musiccoca, cfg_notes, cfg_drums, temperature, top_k):
-    """Bake the pitched backing band ONCE, ONE generate() call PER CHORD-RUN, carrying
-    model state forward through the runs, then crossfade-wrap the whole thing into a
-    seamless loop. Baked once -> a fixed buffer can't drift and playback needs no model
-    calls.
+    """Generate `total_frames` frames of backing in ONE CONTINUOUS pass, driving the model's
+    internal frame stepper (mrt._fn) directly so the NOTES conditioning can vary PER FRAME --
+    a note ONSET (root pitch state 2) on each frame in `onset_frames`, sustain (state 1)
+    elsewhere, everything else -1. This is the frame-aligned onset roll the model entrains to
+    (so it locks tempo/meter) WITHOUT splicing per-beat generate() takes: one unbroken
+    generation, state threaded frame->frame, the model never restarts. drums forced OFF.
+
+    Reaches into MagentaRT2SystemMlxfn internals (._fn, ._initial_state, ._TOKEN_OFFSET,
+    ._num_*, ._sample_rate) because the public generate() builds one static notes mask per
+    call and so cannot carry a per-frame onset map. Mirrors generate()'s arg layout
+    (mlx/system._build_mlxfn_args) and audio assembly. Returns (samples, state, sample_rate,
+    channels)."""
+    import numpy as np
+    import mlx.core as mx
+
+    off = mrt._TOKEN_OFFSET
+    drums_tokens = [0] * mrt._num_drums                  # drums OFF
+    masked_style = [-1] * len(style_tokens)
+
+    def cond_for(notes):
+        # Positive + the two CFG negatives (masked style / masked notes), as generate() builds.
+        cond = mx.array((np.array(style_tokens + notes + drums_tokens, dtype=np.int32) + off
+                         ).reshape(1, 1, -1), dtype=mx.int32)
+        neg_mc = mx.array((np.array(masked_style + notes + drums_tokens, dtype=np.int32) + off
+                           ).reshape(1, 1, -1), dtype=mx.int32)
+        neg_n = mx.array((np.array(style_tokens + [-1] * len(notes) + drums_tokens, dtype=np.int32)
+                          + off).reshape(1, 1, -1), dtype=mx.int32)
+        return cond, neg_mc, neg_n
+
+    scalars = [
+        mx.array([temperature]),
+        mx.array([top_k], dtype=mx.int32),
+        mx.array([cfg_musiccoca]),
+        mx.array([cfg_notes]),
+        mx.array([cfg_drums]),
+    ]
+    forced = mx.zeros((1, 0, mrt._rvq_depth), dtype=mx.int32)
+
+    onset_notes = root_hint_mask(root, on=2)
+    sustain_notes = root_hint_mask(root, on=1)
+
+    if state is None:
+        state = list(mrt._initial_state)
+    audio_frames = []
+    for fi in range(total_frames):
+        cond, neg_mc, neg_n = cond_for(onset_notes if fi in onset_frames else sustain_notes)
+        outputs = mrt._fn([cond] + scalars + [neg_mc, neg_n, forced] + state)
+        mx.eval(outputs)
+        audio_frames.append(np.array(outputs[0]))       # (1, 2, 1920)
+        state = list(outputs[1:])
+
+    all_audio = np.concatenate(audio_frames, axis=-1)    # (1, 2, total_samples)
+    samples = (all_audio[0].T.astype(np.float32) / 32768.0)  # (total_samples, 2)
+    return np.ascontiguousarray(samples), state, mrt._sample_rate, samples.shape[1]
+
+
+def _drum_onset_frame_plan(bpm, time_sig, n_beats):
+    """Per-FRAME drum onset plan for a take of n_beats. Returns (onset_frames, beat_bounds):
+    onset_frames is the set of frame indices that carry a drum ONSET -- the first frame of each
+    BACKBEAT beat (BEAT_GRID's 1-based backbeat set, e.g. {2,4} in 4/4); beat_bounds is
+    [(start_frame, end_frame), ...] per beat. Sibling of _onset_frame_plan but backbeat-aware,
+    so it mirrors beat_plan's old drums=[1]-on-backbeats placement."""
+    bpb = _beats_per_bar(time_sig)
+    backbeats = BEAT_GRID[time_sig][1]               # 1-based beat numbers within a bar
+    counts = _beat_frame_counts(bpm, time_sig, n_beats)
+    onset_frames = set()
+    beat_bounds = []
+    f = 0
+    for k, n in enumerate(counts):
+        if (k % bpb) + 1 in backbeats:               # 1-based beat-in-bar
+            onset_frames.add(f)                      # onset on the beat's first frame
+        beat_bounds.append((f, f + n))
+        f += n
+    return onset_frames, beat_bounds
+
+
+def _bake_drums_onsets(mrt, style_tokens, total_frames, onset_frames, state,
+                       cfg_musiccoca, temperature, top_k):
+    """Generate `total_frames` frames of DRUMS in ONE CONTINUOUS pass, driving mrt._fn directly so
+    the DRUMS conditioning can vary PER FRAME -- a drum ONSET (drums [1]) on each frame in
+    `onset_frames` (the backbeats), masked ([-1] = model's choice, the _fn equivalent of the old
+    drums=None tails/fills) elsewhere. Notes are masked off every frame (drums-only loop, no pitched
+    material). This is the drum counterpart of _bake_take_onsets (which instead varies NOTES and
+    forces drums off): one unbroken generation, state threaded frame->frame, no per-beat restart.
+
+    cfg_musiccoca/temperature/top_k arrive raw from the CLI and may be None; unlike the public
+    generate() this manual path doesn't resolve them, so we fall back to the model's instance
+    defaults here. cfg_notes/cfg_drums use the instance defaults too (1.0) -- matching the old
+    generate()-based drum bake, NOT the backing's stronger cfg_drums. Returns (samples, state,
+    sample_rate, channels)."""
+    import numpy as np
+    import mlx.core as mx
+
+    cfg_musiccoca = mrt.cfg_musiccoca if cfg_musiccoca is None else cfg_musiccoca
+    temperature = mrt.temperature if temperature is None else temperature
+    top_k = mrt.top_k if top_k is None else top_k
+
+    off = mrt._TOKEN_OFFSET
+    notes = [-1] * mrt._num_notes                        # notes OFF (drums-only)
+    masked_style = [-1] * len(style_tokens)
+
+    def cond_for(drums):
+        cond = mx.array((np.array(style_tokens + notes + drums, dtype=np.int32) + off
+                         ).reshape(1, 1, -1), dtype=mx.int32)
+        neg_mc = mx.array((np.array(masked_style + notes + drums, dtype=np.int32) + off
+                           ).reshape(1, 1, -1), dtype=mx.int32)
+        neg_n = mx.array((np.array(style_tokens + [-1] * len(notes) + drums, dtype=np.int32)
+                          + off).reshape(1, 1, -1), dtype=mx.int32)
+        return cond, neg_mc, neg_n
+
+    scalars = [
+        mx.array([temperature]),
+        mx.array([top_k], dtype=mx.int32),
+        mx.array([cfg_musiccoca]),
+        mx.array([mrt.cfg_notes]),
+        mx.array([mrt.cfg_drums]),
+    ]
+    forced = mx.zeros((1, 0, mrt._rvq_depth), dtype=mx.int32)
+
+    onset_drums = [1] * mrt._num_drums                   # drum onset
+    fill_drums = [-1] * mrt._num_drums                   # masked = model's choice (old drums=None)
+
+    if state is None:
+        state = list(mrt._initial_state)
+    audio_frames = []
+    for fi in range(total_frames):
+        cond, neg_mc, neg_n = cond_for(onset_drums if fi in onset_frames else fill_drums)
+        outputs = mrt._fn([cond] + scalars + [neg_mc, neg_n, forced] + state)
+        mx.eval(outputs)
+        audio_frames.append(np.array(outputs[0]))        # (1, 2, 1920)
+        state = list(outputs[1:])
+
+    all_audio = np.concatenate(audio_frames, axis=-1)    # (1, 2, total_samples)
+    samples = (all_audio[0].T.astype(np.float32) / 32768.0)
+    return np.ascontiguousarray(samples), state, mrt._sample_rate, samples.shape[1]
+
+
+def make_backing_loop(mrt, band_prompt, bpm, time_sig, progression, key,
+                      cfg_musiccoca, cfg_notes, cfg_drums, temperature, top_k,
+                      crossfade=False, return_clips=False):
+    """Bake the pitched backing band ONCE, ONE generate() call PER CHORD CHANGE (capped
+    at ~6s of audio), carrying model state forward through the changes, then crossfade-wrap
+    the whole thing into a seamless loop. Baked once -> a fixed buffer can't drift and
+    playback needs no model calls.
 
     What shapes the sound:
-    - **one generate() per chord-run.** chord_runs collapses consecutive identical bars
-      into runs (C,C,G,F -> a 2-bar C, a 1-bar G, a 1-bar F); each run is one generate()
-      sized to that run's bars. The held chord is composed in a single shot rather than
-      restarted each bar.
-    - **state carried run -> run.** Each run's generate() seeds the next via MRT `state`
-      (start None), so the model voice-leads ACROSS the changes instead of N disconnected
-      takes butt-spliced. A final LEAD-OUT run repeats run 0's chord (state still carried)
-      so the seamless wrap splices like-on-like.
-    - **seams.** _crossfade_join smooths each run->run boundary (and the lead-out join);
-      _crossfade_wrap folds the lead-out back over the head for a click-free loop point --
-      same seam strategy as make_drum_loop.
-    - **gentle root-note mask.** notes = root_hint_mask(root) per run: a SINGLE pitch
-      (middle-octave root) on, everything else -1 ("no opinion"). A broad tonal-center
-      hint, not the old graded chord+key mask (that sounded bad). cfg_notes scales it.
-    - **chord QUALITY in the PROMPT.** bar_prompt names the run's chord ("...current
+    - **per-chord take capped at BACKING_MAX_TAKE_SECONDS, ONE continuous pass with a
+      per-frame onset map.** chord_spans collapses the progression into spans of consecutive
+      identical chords in BEATS (not bars). For each span we make ONE take of min(span, ~6s):
+      a span that fits in <=6s is generated at its exact length, a longer span generates a ~6s
+      take and LOOPS it (crossfaded) to fill the span. The take is generated as ONE unbroken
+      stream (_bake_take_onsets drives the model's frame stepper mrt._fn directly), varying
+      only the NOTES conditioning per frame to place a note ONSET at each beat's start. This
+      frame-aligned onset grid is what makes the model lock to tempo/meter -- WITHOUT splicing
+      per-beat takes (which restart the model and sound worse). The public generate() can't do
+      this (it reuses one notes mask per call), so we step _fn ourselves.
+    - **state carried frame->frame and span->span.** Within a take the model never restarts
+      (continuous _fn stepping); across spans the final state seeds the next (start None), so
+      the model voice-leads across the changes instead of disconnected takes butt-spliced. A
+      final LEAD-OUT span repeats span 0's chord (state carried) so the wrap splices
+      like-on-like.
+    - **seams.** _crossfade_join smooths each span->span boundary (and the lead-out join);
+      _crossfade_wrap folds a lead-out back over the head both for a long span's internal
+      take-repeat AND for the whole-loop wrap -- same seam strategy as make_drum_loop.
+    - **gentle root-note mask + onsets.** notes is a SINGLE pitch (middle-octave root): state
+      2 (onset) on each onset frame, state 1 (sustain) elsewhere, everything else -1 ("no
+      opinion"). A broad tonal-center hint with a rhythmic pulse, not the old graded chord+key
+      mask (that sounded bad). cfg_notes scales it; BACKING_ONSET_GRANULARITY controls whether
+      onsets land every beat or once per bar.
+    - **chord QUALITY in the PROMPT.** bar_prompt names the span's chord ("...current
       chord: C major") -- the mask's lone root can't encode maj/min, so the prompt does.
     - **drums=0 (off), not None.** None == "model's choice", which let the backing compose
       its own kit; we force drums OFF (pushed by cfg_drums) so this layer is pitched-only.
 
-    progression: list of {start_beat,length_beats,root,quality} tiling [0, learn_bars*bpb).
+    progression: list of {start_beat,length_beats,root,quality} tiling [0, total_beats).
     key is accepted for signature stability but unused (harmony = prompt + root mask).
 
     Returns (samples, sample_rate, channels, beat_offsets) -- same contract as
-    make_drum_loop: beat_offsets has one (start,end) per logical beat over the LOOP
-    region (total_beats beats), tiling contiguously, last end == len."""
+    make_drum_loop: beat_offsets has one (start,end) per logical beat over the LOOP region
+    (total_beats beats), tiling contiguously, last end == len. The per-beat offsets are the
+    TRUE per-beat sample bounds (from each beat's actually-generated chunks) so the unchanged
+    beat-lockstep player/mixer keeps working and the grid lines up tightly; the backing wraps
+    at its OWN length (not padded to the drum loop), so chord changes may slowly rotate against
+    the drum grid over many loops."""
     import numpy as np
 
     bpb = _beats_per_bar(time_sig)
-    total_beats = sum(s["length_beats"] for s in progression)  # == learn_bars*bpb
+    total_beats = sum(s["length_beats"] for s in progression)
 
-    # Runs of consecutive identical chords + one lead-out run repeating run 0's chord so
-    # the seamless wrap splices like-on-like. Each run generates n_bars*bpb beats.
-    runs = chord_runs(progression, total_beats, bpb)
-    leadout = (runs[0][0], runs[0][1], 1)  # one bar of run 0's chord
-    runs_with_leadout = runs + [leadout]
+    # Spans of consecutive identical chords (in BEATS) + one lead-out span repeating span
+    # 0's chord so the seamless wrap splices like-on-like.
+    spans = chord_spans(progression, total_beats, bpb)
+    leadout = (spans[0][0], spans[0][1], 1)  # one beat of span 0's chord
+    spans_with_leadout = spans + [leadout]
 
     sample_rate = channels = None
     state = None
     prev_tail = None
-    pieces = []          # per-run (samples, [per-beat planned frame counts]) after joins
-    for ri, (root, quality, n_bars) in enumerate(runs_with_leadout):
-        embedding = mrt.embed_style(bar_prompt(band_prompt, root, quality))
-        notes = root_hint_mask(root)
-        beat_frames = _beat_frame_counts(bpm, time_sig, n_bars * bpb)
-        gen_frames = sum(beat_frames)
+    pieces = []          # per-span (samples, local_beat_bounds) after joins
+    clips = []           # per-span RAW generated take (pre tile/splice), for --generation-debug
+    for si, (root, quality, n_beats) in enumerate(spans_with_leadout):
+        _bprompt = bar_prompt(band_prompt, root, quality)
+        print(f"  [embed:backing span {si}] prompt={_bprompt!r}")
+        style_tokens = mrt.tokenize_style(mrt.embed_style(_bprompt)).tolist()
+        take_beats = _take_beats(bpm, time_sig, n_beats, BACKING_MAX_TAKE_SECONDS)
+
         t0 = time.time()
-        wav, state = mrt.generate(style=embedding, frames=gen_frames, state=state,
-                                  drums=[0], notes=notes, cfg_musiccoca=cfg_musiccoca,
-                                  cfg_notes=cfg_notes, cfg_drums=cfg_drums,
-                                  temperature=temperature, top_k=top_k)
+        # Bake the take in ONE continuous _fn pass with a per-frame onset map (no per-beat
+        # splicing). For a long-held chord we bake take_beats (+1 lead-out beat to fold over
+        # its head) and tile; otherwise we bake the whole span exactly.
+        gen_beats = (take_beats + 1) if take_beats < n_beats else n_beats
+        onset_frames, beat_bounds = _onset_frame_plan(bpm, time_sig, gen_beats,
+                                                      BACKING_ONSET_GRANULARITY)
+        total_frames = beat_bounds[-1][1]
+        print(f"  [generate:backing span {si} {chord_name(root, quality)}] "
+              f"frames={total_frames}, onsets={len(onset_frames)}, state="
+              f"{'None' if state is None else '<carried>'}, drums=[0], notes=root@{root}, "
+              f"cfg_musiccoca={cfg_musiccoca}, cfg_notes={cfg_notes}, cfg_drums={cfg_drums}, "
+              f"temperature={temperature}, top_k={top_k}")
+        take, state, sr, ch = _bake_take_onsets(
+            mrt, style_tokens, root, total_frames, onset_frames, state,
+            cfg_musiccoca, cfg_notes, cfg_drums, temperature, top_k)
         if sample_rate is None:
-            sample_rate, channels = wav.sample_rate, wav.num_channels
-        run = np.ascontiguousarray(wav.samples, dtype=np.float32)
-        print(f"  [backing] run {ri} {chord_name(root, quality)} x{n_bars}bar "
-              f"gen {time.time() - t0:.2f}s")
+            sample_rate, channels = sr, ch
+        spf = take.shape[0] / total_frames               # samples per frame (~1920 @48k)
+        # The raw take exactly as the model generated it (before any tile/splice/wrap). The
+        # lead-out span (last) is a wrap artifact, not a real chord clip, so skip it.
+        if si < len(spans):
+            clips.append((chord_name(root, quality), n_beats, take))
 
-        # Crossfade-join this run's head onto the previous run's tail so the seam doesn't
-        # click. Cap the fade to this run's first beat (keeps that beat valid) and to what
-        # the tail can supply.
-        if prev_tail is not None:
-            fade_len = min(len(prev_tail), run.shape[0],
-                           round(run.shape[0] * beat_frames[0] / (sum(beat_frames) or 1)))
+        if take_beats < n_beats:
+            # Long-held chord: crossfade-wrap the take(+lead-out) into a seamless unit, then
+            # tile/trim to the full span length. Per-beat bounds repeat the take's pattern.
+            take_samples = round(beat_bounds[take_beats - 1][1] * spf)  # end of last take beat
+            span_samples = round(sum(_beat_frame_counts(bpm, time_sig, n_beats)) * spf)
+            fl = min(take.shape[0] - take_samples, take_samples) if crossfade else 0
+            unit = _crossfade_wrap(take[:take_samples + fl], fl) if fl > 0 else take[:take_samples]
+            unit_bounds = [(round(s * spf), round(e * spf)) for s, e in beat_bounds[:take_beats]]
+            reps = -(-span_samples // unit.shape[0]) + 1  # ceil + 1 spare for the wrap fade
+            tiled = np.tile(unit, (reps, 1))
+            wfl = min(unit.shape[0], span_samples) if crossfade else 0  # wrap the tiled repeat too
+            span = _crossfade_wrap(tiled[:span_samples + wfl], wfl) if wfl > 0 else tiled[:span_samples]
+            local_bounds = []
+            for k in range(n_beats):
+                base = (k // take_beats) * unit.shape[0]
+                s, e = unit_bounds[k % take_beats]
+                local_bounds.append((min(base + s, span.shape[0]), min(base + e, span.shape[0])))
+        else:
+            # Span fits in <=6s: the take IS the span.
+            span = take
+            local_bounds = [(round(s * spf), round(e * spf)) for s, e in beat_bounds]
+        print(f"  [backing] span {si} {chord_name(root, quality)} {n_beats}beat "
+              f"(take {take_beats}beat) gen {time.time() - t0:.2f}s")
+
+        # First beat of this span (samples) -- used to cap join fades so beat 0 stays valid.
+        beat0 = max(1, local_bounds[0][1] - local_bounds[0][0])
+        # Crossfade-join this span's head onto the previous span's tail so the seam doesn't
+        # click. _crossfade_join overlaps in place (length preserved), so local_bounds stay
+        # valid. Cap the fade to this span's first beat and to what the tail can supply.
+        if crossfade and prev_tail is not None:
+            fade_len = min(len(prev_tail), span.shape[0], beat0)
             if fade_len > 0:
-                run = _crossfade_join(prev_tail, run, fade_len)
-        prev_tail = run[-beat_frames[-1]:] if beat_frames[-1] <= run.shape[0] else run
-        pieces.append((run, beat_frames))
+                span = _crossfade_join(prev_tail, span, fade_len)
+        prev_tail = span[-beat0:]
+        pieces.append((span, local_bounds))
 
-    # Concatenate the loop runs (everything but the lead-out) into the loop body, tracking
-    # per-beat offsets from where each run's audio ACTUALLY landed (runs differ in length;
-    # we scale each run's planned beat ratios to its produced length).
-    loop_runs = pieces[:-1]
+    # Concatenate the loop spans (everything but the lead-out) into the loop body, shifting
+    # each span's TRUE per-beat bounds by the running cursor.
+    loop_spans = pieces[:-1]
     leadout_samples = pieces[-1][0]
-    body = np.concatenate([p[0] for p in loop_runs], axis=0)
-    beat_offsets = []
+    body = np.concatenate([p[0] for p in loop_spans], axis=0)
+    starts = []
     cursor = 0
-    for run, beat_frames in loop_runs:
-        produced = run.shape[0]
-        planned_total = sum(beat_frames) or 1
-        acc = 0.0
-        run_start = cursor
-        for bf in beat_frames:
-            acc += bf
-            end = run_start + round(produced * acc / planned_total)
-            beat_offsets.append((cursor, end))
-            cursor = end
+    for span, local_bounds in loop_spans:
+        for s, _e in local_bounds:
+            starts.append(cursor + s)
+        cursor += span.shape[0]
+    # Contiguous grid: each beat runs from its true start to the next beat's start; the last
+    # beat ends at the body length. (Crossfade joins / tile clamping can otherwise leave tiny
+    # gaps; the player needs a gapless tiling whose last end == len.)
+    beat_offsets = [(starts[i], starts[i + 1] if i + 1 < len(starts) else body.shape[0])
+                    for i in range(len(starts))]
     assert len(beat_offsets) == total_beats, (len(beat_offsets), total_beats)
 
-    # Seamless loop: append the lead-out (run 0's chord, state-continued) past the loop
-    # point and crossfade it back over the head. Cap the fade to the first beat so slice 0
-    # stays valid (mirrors make_drum_loop's wrap).
-    fade_len = min(leadout_samples.shape[0], beat_offsets[0][1] - beat_offsets[0][0])
-    trimmed = np.concatenate([body, leadout_samples[:fade_len]], axis=0)
-    samples = _crossfade_wrap(trimmed, fade_len)
+    if not crossfade:
+        # No crossfade: hard butt-splice the loop (drop the lead-out). The end->start seam is
+        # an audible cut -- that's the point, to compare against the smoothed version.
+        samples = body
+    else:
+        # Seamless loop: append the lead-out (span 0's chord, state-continued) past the loop
+        # point and crossfade it back over the head. Cap the fade to the first beat so slice 0
+        # stays valid (mirrors make_drum_loop's wrap).
+        fade_len = min(leadout_samples.shape[0], beat_offsets[0][1] - beat_offsets[0][0])
+        trimmed = np.concatenate([body, leadout_samples[:fade_len]], axis=0)
+        samples = _crossfade_wrap(trimmed, fade_len)
+
+    if return_clips:
+        return samples, sample_rate, channels, beat_offsets, clips
     return samples, sample_rate, channels, beat_offsets
 
 
 def _mix_beats(a, b, backing_gain):
-    """Sum two per-beat slices into one. They may differ in length (drums loop and
-    backing loop wrap at different beat counts, and beat_plan's fractional-frame
-    accumulator makes a given beat index a few samples longer/shorter), so we mix
-    over the shorter length and tail the longer one through unchanged. Backing is
-    attenuated by backing_gain before summing, then the result is soft-limited so
-    drums + backing can't clip."""
+    """Sum two per-beat slices (drums `a` + backing `b`) into one. They may differ in
+    length (drums loop and backing loop wrap at different beat counts, and beat_plan's
+    fractional-frame accumulator makes a given beat index a few samples longer/shorter),
+    so we mix over the shorter length and tail the longer one through unchanged.
+
+    Both layers are scaled by a fixed MIX_HEADROOM so their sum stays within full-scale
+    WITHOUT a per-beat limiter. We deliberately do NOT divide each beat by its peak: that
+    would attenuate the drums only on beats where the backing's onset clips, ducking the
+    kit in sync with the backing -- an amplitude wobble that's heard as the groove
+    changing / a beat dropping when a loud layer comes in. A constant scale keeps every
+    drum beat at the same level, so the groove stays steady."""
     import numpy as np
 
     n = min(a.shape[0], b.shape[0])
-    out = (a[:n] + backing_gain * b[:n])
-    tail = a[n:] if a.shape[0] > n else backing_gain * b[n:]
+    out = MIX_HEADROOM * (a[:n] + backing_gain * b[:n])
+    tail = MIX_HEADROOM * (a[n:] if a.shape[0] > n else backing_gain * b[n:])
     out = np.concatenate([out, tail], axis=0)
-    peak = float(np.max(np.abs(out))) if out.size else 0.0
-    if peak > 1.0:
-        out = out / peak
     return np.ascontiguousarray(out, dtype=np.float32)
 
 
@@ -734,113 +1021,6 @@ def _detect_repeat(roots):
     if len(set(roots[:L])) < 2:        # enforce "one root change" inside the loop
         return None
     return L
-
-
-def learn_progression(loop, capture, bpm, time_sig, learn_bars,
-                      player, count_in_bars=4):
-    """Run the count-in over the FIXED drum loop, then ADAPTIVELY detect the
-    progression loop -- no fixed length.
-
-    Drums are replayed beat-by-beat from the baked loop (`loop`, a DrumLoopFeeder)
-    -- no model calls here, so the groove is steady. The player is already sounding
-    the loop. While drums play we snapshot the input ring buffer per beat and
-    accumulate one root per bar (root only; quality ignored). After each completed
-    bar we test whether the root sequence-since-start is two back-to-back copies of
-    itself (a confirmed loop, >=2 bars, with at least one root change). The first
-    cycle IS the progression; we lock it and stop listening. There is no upper
-    bound -- a held single chord never locks, so we keep listening until a real
-    loop is played.
-
-    `learn_bars` is DEPRECATED/ignored (length is now open-ended); kept in the
-    signature so the --learn-bars CLI flag doesn't break.
-
-    Returns (progression, key) where progression is a list of
-      {"start_beat", "length_beats", "root", "quality"}
-    and key is (root, mode). Beats are indexed from the first captured beat (0).
-    """
-    import numpy as np
-
-    bpb = _beats_per_bar(time_sig)
-    captured_beats = []   # (pitch_class_set, chroma12) per captured beat -- feeds estimate_key
-
-    # Pace beat-pushes to roughly real time: the loop is only `loop_bars` long, so
-    # if we pushed every beat at once we'd race ahead of the player and capture the
-    # input before it's been played. Wait for the lead cushion to drain between beats.
-    def push_beat():
-        while not player.needs_audio():
-            time.sleep(0.005)
-        return loop.push_next_beat(player)
-
-    # Phase 1 -- count-in: `count_in_bars` full bars of drums, no capture. Play
-    # exactly count_in_bars*bpb beats so capture starts cleanly on a downbeat.
-    print(f"count-in ({count_in_bars} bars)...")
-    intro_total = count_in_bars * bpb
-    for played in range(intro_total):
-        if played % bpb == 0:
-            print(f"intro bar {played // bpb + 1}/{count_in_bars}")
-        push_beat()
-
-    # Phase 2 -- listen open-endedly, one root per bar, until a loop repeats.
-    print("LISTENING for the loop (play it through twice)...")
-    bar_chroma = np.zeros(12)   # accumulates the current bar's per-beat chroma
-    roots = []                  # one root pitch-class (or None) per completed bar
-    loop_len = None
-    while True:
-        push_beat()
-        hist = _beat_chroma(capture, bpm)
-        pcs = {p for p in range(12) if hist[p] > 0}
-        captured_beats.append((pcs, np.asarray(hist, dtype=np.float64)))
-        bar_chroma = bar_chroma + hist
-        if len(captured_beats) % bpb:
-            continue  # mid-bar
-
-        # Bar just completed -- decide its root. Carry the previous root through a
-        # silent bar so a quiet gap doesn't break the loop; skip leading silence.
-        r = _bar_root(bar_chroma)
-        bar_chroma = np.zeros(12)
-        if r is None and roots:
-            r = roots[-1]
-        if r is None:
-            print("bar -: silent (waiting for first chord)")
-            continue
-        roots.append(r)
-        bar_idx = len(roots)
-
-        # Live feedback: the root just heard + the running sequence forming.
-        seq = " ".join(NOTE_NAMES[x] for x in roots)
-        print(f"bar {bar_idx}: heard {NOTE_NAMES[r]}   [{seq}]")
-
-        loop_len = _detect_repeat(roots)
-        if loop_len is not None:
-            roots = roots[:loop_len]   # the first cycle IS the progression
-            break
-
-    print(f"[locked] {loop_len}-bar loop: " + " ".join(NOTE_NAMES[x] for x in roots))
-
-    # --- Build progression from the locked roots --------------------------
-    # Stable key over everything heard: sum all per-beat chroma, estimate once.
-    total_chroma = np.sum([c for _, c in captured_beats], axis=0)
-    key = estimate_key(total_chroma, modal_margin=capture._modal_margin)
-
-    # Root-only downstream, so pick a single quality from the key for the labels.
-    kr, km = key
-    quality = "min" if MODE_ALIASES.get(km, km) == "aeolian" else "maj"
-    filled = [(r, quality) for r in roots for _ in range(bpb)]  # beat-level
-
-    # Merge adjacent identical chords into segments.
-    progression = []
-    for i, ch in enumerate(filled):
-        if progression and progression[-1]["root"] == ch[0] \
-                and progression[-1]["quality"] == ch[1]:
-            progression[-1]["length_beats"] += 1
-        else:
-            progression.append({"start_beat": i, "length_beats": 1,
-                                 "root": ch[0], "quality": ch[1]})
-
-    print(f"\n[key] {NOTE_NAMES[kr]} {mode_name(km)}")
-    print("[progression] " + " | ".join(
-        f"{chord_name(s['root'], s['quality'])}x{s['length_beats']}" for s in progression))
-    return progression, key
 
 
 # --- Queued player (self-contained; modeled on hello_world.stream_beats) ---
@@ -994,9 +1174,22 @@ class DuplexStream:
 
 class DrumKeepAlive:
     """Keeps the baked drum loop sounding on a background thread while the MAIN
-    thread is busy baking the backing (make_backing_loop). Without this the output
-    goes silent between Stage 2 (learning) and Stage 3 (play) -- the bake blocks the
-    main thread for seconds.
+    thread is busy baking the backing (make_backing_loop), AND tracks where the live
+    player is in the progression so the band can enter in phase. Without this the
+    output goes silent between Stage 2 (learning) and Stage 3 (play) -- the bake blocks
+    the main thread for seconds.
+
+    We assume the live player keeps cycling the progression along with the continuous
+    drums. The drum loop beat index (`loop.i`) is the live-phase clock: `lock_beat` is
+    where the loop locked (a bar boundary), so `loop.i - lock_beat` is the number of
+    drum beats since the live player restarted at bar 1. At each bar start we print the
+    ASSUMED live position (`bar X/N (assumed): <chord>`) as a continuous positional cue
+    through the otherwise-blind bake gap.
+
+    With `enter_at_top=True` the thread stops itself the instant the live phase reaches
+    the top of the progression (`(loop.i - lock_beat) % total_beats == 0`) on a bar
+    start -- the caller then enters the band on that exact downbeat, in phase with the
+    live player. Without it, it runs until stop()/__exit__ (used while the bake runs).
 
     Safe to run off-thread: it only memcpys buffer slices into the player's
     thread-safe queue (loop.push_next_beat -> player.push_samples); no MLX touched
@@ -1005,18 +1198,53 @@ class DrumKeepAlive:
     queue again before playback starts. The drum loop index is left wherever it
     landed; it wraps, and drums<->chord phase rotating is already accepted."""
 
-    def __init__(self, loop, player):
+    def __init__(self, loop, player, progression=None, total_beats=None,
+                 lock_beat=0, beats_per_bar=None, enter_at_top=False):
         self._loop = loop
         self._player = player
+        self._progression = progression
+        self._total_beats = total_beats
+        self._lock_beat = lock_beat
+        self._bpb = beats_per_bar
+        self._enter_at_top = enter_at_top
         self._stop = threading.Event()
+        self._reached_top = threading.Event()  # set when enter_at_top fires
         self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _live_beat(self):
+        """Drum beats since the live player restarted the progression at bar 1."""
+        return self._loop.i - self._lock_beat
+
+    def _print_cue(self):
+        """Print the ASSUMED live progression position at a bar start."""
+        if self._progression is None or not self._total_beats:
+            return
+        live = self._live_beat()
+        n_bars = self._total_beats // self._bpb
+        bar = (live % self._total_beats) // self._bpb + 1
+        root, quality = _chord_at_beat(self._progression, live, self._total_beats)
+        print(f"  bar {bar}/{n_bars} (assumed): {chord_name(root, quality)}")
 
     def _run(self):
         while not self._stop.is_set():
-            if self._player.needs_audio():
-                self._loop.push_next_beat(self._player)
-            else:
+            if not self._player.needs_audio():
                 self._stop.wait(0.005)
+                continue
+            # Entering-at-top: stop ON the top-of-progression downbeat, BEFORE pushing
+            # it, so loop.i sits exactly on that beat and the caller's feeder takes over
+            # there with no gap or double-push.
+            if self._enter_at_top and self._live_beat() % self._total_beats == 0 \
+                    and self._live_beat() > 0:
+                self._print_cue()
+                self._reached_top.set()
+                return
+            bar_start = self._loop.push_next_beat(self._player)
+            if bar_start:
+                self._print_cue()
+
+    def wait_for_top(self):
+        """Block until the enter_at_top thread reaches the top of the progression."""
+        self._reached_top.wait()
 
     def __enter__(self):
         self._thread.start()
@@ -1025,6 +1253,237 @@ class DrumKeepAlive:
     def __exit__(self, *exc):
         self._stop.set()
         self._thread.join()
+
+
+class ProgressionLearner:
+    """The clock + ears for PROGRESSIVE learning, on ONE background thread. Owns the
+    drum clock (pushing the fixed loop beat-by-beat), the listening (per-beat input
+    snapshot + per-bar root detection), and -- once the main thread hands it a baked
+    vamp -- mixing that vamp under the drums in real time.
+
+    Why a thread: MLX generation MUST stay on the main thread (the thread that imported
+    the model). To bake the single-chord vamp on the main thread the instant bar 1's
+    root is heard, the real-time clock+ears can't also be on the main thread. So this
+    class is the off-thread clock (copy-only pushes into the player queue, same
+    discipline as DrumKeepAlive) AND the off-thread ears (read-only numpy snapshot of
+    capture._buf, the same benign race the audio thread already tolerates). It NEVER
+    touches MLX.
+
+    Lifecycle (driven by the main-thread orchestrator in main()):
+      start()                 -> count-in, then listen
+      wait_first_chord()      -> blocks until bar 1's root is heard (Stage B trigger)
+      install_vamp(feeder)    -> main thread hands over the baked vamp; it layers in at
+                                 the next bar boundary
+      wait_locked()           -> blocks until the loop repeats; returns
+                                 (progression, key, lock_beat)
+      ... main thread bakes the full backing while this keeps drums+vamp alive,
+          printing the assumed live position each bar ...
+      enter_at_top()          -> ask the thread to stop ON the next top-of-progression
+                                 downbeat (vamp still sounding up to it)
+      wait_for_top() / stop() -> block for that downbeat, then join
+
+    The drum loop index `loop.i` is written by ONLY this thread while it runs; the main
+    thread reads it after stop()/join() (single-writer, same invariant as before)."""
+
+    def __init__(self, loop, capture, bpm, time_sig, player,
+                 count_in_bars=4, beats_per_bar=None, backing_gain=0.9):
+        self._loop = loop
+        self._capture = capture
+        self._bpm = bpm
+        self._time_sig = time_sig
+        self._player = player
+        self._count_in_bars = count_in_bars
+        self._bpb = beats_per_bar if beats_per_bar is not None else _beats_per_bar(time_sig)
+        self._backing_gain = backing_gain
+
+        # learner -> main
+        self._first_chord = threading.Event()
+        self._first_root = None
+        self._first_quality = "maj"   # pre-lock we only know the root; quality rides in the prompt
+        self._locked = threading.Event()
+        self._result = None           # (progression, key, lock_beat)
+
+        # main -> learner
+        self._vamp_lock = threading.Lock()
+        self._pending_vamp = None     # installed vamp feeder, promoted on a bar boundary
+        self._vamp = None             # active vamp feeder (mixed under the drums)
+        self._stop = threading.Event()
+        self._enter_at_top = False
+        self._reached_top = threading.Event()
+
+        # Earliest drum-beat index at which the vamp may layer in. The vamp must NOT come
+        # in before: the full warm-up (count_in_bars of drums only) + 1 bar to actually
+        # hear the chord being played + 1 bar to bake/align it. So the floor is 2 full
+        # bars after the warm-up ends -> the vamp enters at bar (count_in_bars + 2) start
+        # at the earliest (e.g. bar 6 for a 4-bar warm-up). The bake can push it later;
+        # this only guarantees it never comes in EARLIER.
+        self._vamp_earliest_beat = (count_in_bars + 2) * self._bpb
+
+        self._lock_beat = 0           # set at lock; live-phase reference for cue printing
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    # --- public API (main thread) ---
+
+    def start(self):
+        self._thread.start()
+
+    def wait_first_chord(self):
+        self._first_chord.wait()
+        return self._first_root, self._first_quality
+
+    def install_vamp(self, feeder):
+        with self._vamp_lock:
+            self._pending_vamp = feeder
+
+    def wait_locked(self):
+        self._locked.wait()
+        return self._result
+
+    def enter_at_top(self):
+        self._enter_at_top = True
+
+    def wait_for_top(self):
+        self._reached_top.wait()
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join()
+
+    # --- internals (background thread) ---
+
+    def _push_beat(self):
+        """Push ONE beat at playback pace: drums alone, or drums+vamp mixed once a vamp
+        is installed. Promote a pending vamp only on a bar boundary so it enters cleanly
+        on a downbeat. Returns whether this beat was a drum-loop bar start."""
+        while not self._player.needs_audio() and not self._stop.is_set():
+            self._stop.wait(0.005)
+        with self._vamp_lock:
+            if (self._pending_vamp is not None
+                    and self._loop.i % self._bpb == 0
+                    and self._loop.i >= self._vamp_earliest_beat):
+                self._vamp = self._pending_vamp
+                self._pending_vamp = None
+            vamp = self._vamp
+        if vamp is None:
+            return self._loop.push_next_beat(self._player)
+        d_slice, bar_start = self._loop.next_slice()
+        b_slice, _ = vamp.next_slice()
+        self._player.push_samples(_mix_beats(d_slice, b_slice, self._backing_gain))
+        return bar_start
+
+    def _print_cue(self):
+        """Print the ASSUMED live progression position at a bar start (post-lock only)."""
+        progression, _key, _lock = self._result
+        total_beats = sum(s["length_beats"] for s in progression)
+        live = self._loop.i - self._lock_beat
+        n_bars = total_beats // self._bpb
+        bar = (live % total_beats) // self._bpb + 1
+        root, quality = _chord_at_beat(progression, live, total_beats)
+        print(f"  bar {bar}/{n_bars} (assumed): {chord_name(root, quality)}")
+
+    def _run(self):
+        import numpy as np
+
+        bpb = self._bpb
+        capture = self._capture
+        bpm = self._bpm
+        captured_beats = []   # (pcs, chroma12) per captured beat -- feeds estimate_key
+
+        # Phase 1 -- count-in: count_in_bars full bars of drums, no capture.
+        print(f"count-in ({self._count_in_bars} bars)...")
+        intro_total = self._count_in_bars * bpb
+        for played in range(intro_total):
+            if self._stop.is_set():
+                return
+            if played % bpb == 0:
+                print(f"intro bar {played // bpb + 1}/{self._count_in_bars}")
+            self._push_beat()
+
+        # Phase 2 -- listen open-endedly, one root per bar, until a loop repeats.
+        print("LISTENING for the loop (play it through twice)...")
+        bar_chroma = np.zeros(12)
+        roots = []
+        loop_len = None
+        while not self._stop.is_set():
+            self._push_beat()
+            hist = _beat_chroma(capture, bpm)
+            pcs = {p for p in range(12) if hist[p] > 0}
+            captured_beats.append((pcs, np.asarray(hist, dtype=np.float64)))
+            bar_chroma = bar_chroma + hist
+            if len(captured_beats) % bpb:
+                continue  # mid-bar
+
+            r = _bar_root(bar_chroma)
+            bar_chroma = np.zeros(12)
+            if r is None and roots:
+                r = roots[-1]
+            if r is None:
+                print("bar -: silent (waiting for first chord)")
+                continue
+            roots.append(r)
+            bar_idx = len(roots)
+
+            # Stage B trigger: the FIRST real root heard. The main thread is blocked in
+            # wait_first_chord(); it bakes the one-chord vamp and installs it.
+            if not self._first_chord.is_set():
+                self._first_root = r
+                self._first_quality = "maj"
+                self._first_chord.set()
+
+            seq = " ".join(NOTE_NAMES[x] for x in roots)
+            print(f"bar {bar_idx}: heard {NOTE_NAMES[r]}   [{seq}]")
+
+            loop_len = _detect_repeat(roots)
+            if loop_len is not None:
+                roots = roots[:loop_len]
+                break
+        if self._stop.is_set():
+            return
+
+        # Drum beat index at lock (a bar boundary). The NEXT drum downbeat is where the
+        # live player restarts the progression at bar 1 -- the live-phase reference.
+        self._lock_beat = self._loop.i
+        lock_beat = self._lock_beat
+        print(f"[locked] {loop_len}-bar loop: " + " ".join(NOTE_NAMES[x] for x in roots))
+
+        # Build progression + key from the locked roots (same as the old learn_progression).
+        total_chroma = np.sum([c for _, c in captured_beats], axis=0)
+        key = estimate_key(total_chroma, modal_margin=capture._modal_margin)
+        kr, km = key
+        quality = "min" if MODE_ALIASES.get(km, km) == "aeolian" else "maj"
+        filled = [(r, quality) for r in roots for _ in range(bpb)]
+        progression = []
+        for i, ch in enumerate(filled):
+            if progression and progression[-1]["root"] == ch[0] \
+                    and progression[-1]["quality"] == ch[1]:
+                progression[-1]["length_beats"] += 1
+            else:
+                progression.append({"start_beat": i, "length_beats": 1,
+                                    "root": ch[0], "quality": ch[1]})
+        print(f"\n[key] {NOTE_NAMES[kr]} {mode_name(km)}")
+        print("[progression] " + " | ".join(
+            f"{chord_name(s['root'], s['quality'])}x{s['length_beats']}" for s in progression))
+
+        self._result = (progression, key, lock_beat)
+        total_beats = sum(s["length_beats"] for s in progression)
+        self._locked.set()
+
+        # Phase 3 -- post-lock tail: keep drums+vamp going (the master clock) while the
+        # main thread bakes the full backing. Print the assumed live position each bar.
+        # When asked to enter-at-top, stop ON the next top-of-progression downbeat so the
+        # caller's band takes over there, in phase, with the vamp sounding right up to it.
+        while not self._stop.is_set():
+            if not self._player.needs_audio():
+                self._stop.wait(0.005)
+                continue
+            live = self._loop.i - lock_beat
+            if self._enter_at_top and live % total_beats == 0 and live > 0:
+                self._print_cue()
+                self._reached_top.set()
+                return
+            bar_start = self._push_beat()
+            if bar_start:
+                self._print_cue()
 
 
 def play_band_forever(feeder, label, player):
@@ -1047,11 +1506,89 @@ def play_band_forever(feeder, label, player):
                     time.sleep(0.01)
                     continue
                 # Print the chord of the bar that's about to start, before pushing it.
+                # Bar shown as position WITHIN the progression (bar X/N) + loop count, so a
+                # repeat of the phrase is obvious (bar resets to 1/N, loop ticks up).
                 if feeder.beat % feeder.bpb == 0:
                     root, quality = feeder.current_chord()
-                    bar = feeder.beat // feeder.bpb + 1
-                    print(f"  bar {bar}: {chord_name(root, quality)}")
+                    n_bars = feeder.total_beats // feeder.bpb
+                    bar = (feeder.beat % feeder.total_beats) // feeder.bpb + 1
+                    loop = feeder.beat // feeder.total_beats + 1
+                    print(f"  bar {bar}/{n_bars} (loop {loop}): {chord_name(root, quality)}")
                 feeder.push_next_beat(player)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        print("\nStopped.")
+        player.close()
+
+
+def play_band_once(feeder, label, player):
+    """Play the baked progression EXACTLY ONCE (total_beats beats) and stop -- the
+    --backing-only --no-repeat path. No forever-loop, so you hear only what was baked
+    without the loop-point crossfade-wrap repeating. Pushes all beats (the player drains
+    them from its queue), waits for the queue to empty, then stops. q/Ctrl+C aborts early.
+    No model calls -- pure buffer playback."""
+    print(f"{label}")
+    print(f"  playing once ({feeder.total_beats} beats), no loop. [q] quit")
+    try:
+        with raw_keys() as poll:
+            # Push every beat of the single progression pass.
+            while feeder.beat < feeder.total_beats:
+                if poll() in ("q", "\x03"):
+                    return
+                if not player.needs_audio():
+                    time.sleep(0.01)
+                    continue
+                if feeder.beat % feeder.bpb == 0:
+                    root, quality = feeder.current_chord()
+                    n_bars = feeder.total_beats // feeder.bpb
+                    bar = feeder.beat // feeder.bpb + 1
+                    print(f"  bar {bar}/{n_bars}: {chord_name(root, quality)}")
+                feeder.push_next_beat(player)
+            # Wait for the queued audio to actually play out before stopping.
+            while player._queued_samples() > 0:
+                if poll() in ("q", "\x03"):
+                    return
+                time.sleep(0.02)
+            time.sleep(player._lead_seconds)  # let the lead-cushion carry drain
+    except KeyboardInterrupt:
+        pass
+    finally:
+        print("\nStopped.")
+        player.close()
+
+
+def play_clips_with_silence(clips, sample_rate, channels, label, player, gap_seconds=1.0):
+    """--generation-debug: play each RAW generated clip ONCE, in order, with `gap_seconds`
+    of silence between them, then stop. No tiling, splicing, or looping -- you hear exactly
+    what the model produced per chord span. q/Ctrl+C aborts. Pure buffer playback."""
+    import numpy as np
+
+    player.configure(sample_rate, channels)
+    gap = np.zeros((int(gap_seconds * sample_rate), channels), dtype=np.float32)
+    lead = int(player._lead_seconds * sample_rate)  # queued floor == when this clip starts sounding
+    print(f"{label}")
+    print(f"  {len(clips)} clip(s), {gap_seconds:.0f}s silence between. [q] quit")
+    try:
+        with raw_keys() as poll:
+            for i, (name, n_beats, take) in enumerate(clips):
+                if i:
+                    player.push_samples(gap)
+                player.push_samples(take)
+                # Wait until everything BEFORE this clip has played out (queue drained down to
+                # the lead buffer) -- i.e. this clip is what's now starting to sound. Log THEN,
+                # so the printed chord matches the audio you hear (the "we're in F now" cue).
+                while player._queued_samples() > take.shape[0] + lead:
+                    if poll() in ("q", "\x03"):
+                        return
+                    time.sleep(0.02)
+                print(f"  clip {i + 1}/{len(clips)}: {name} "
+                      f"({n_beats} beat, {take.shape[0] / sample_rate:.1f}s)")
+            while player._queued_samples() > 0:
+                if poll() in ("q", "\x03"):
+                    return
+                time.sleep(0.02)
+            time.sleep(player._lead_seconds)
     except KeyboardInterrupt:
         pass
     finally:
@@ -1072,6 +1609,10 @@ def main():
                         "until the played loop repeats)")
     p.add_argument("--count-in-bars", type=int, default=4,
                    help="bars of drums-only intro before learning starts")
+    p.add_argument("--vamp", action="store_true",
+                   help="progressive vamp: layer a single-chord backing under the drums "
+                        "as soon as the first chord is heard, before the full progression "
+                        "locks (off by default)")
     p.add_argument("--loop-bars", type=int, default=4,
                    help="length of the fixed drum loop that's baked once and replayed")
     p.add_argument("--input-device", default="iD4",
@@ -1118,12 +1659,40 @@ def main():
                    help="--backing-only progression: comma-separated chords, one bar "
                         "each (e.g. 'C, Am, F, G'). Names are <letter><#/b?><quality>, "
                         "quality in maj/min/dim/aug spellings (empty = major).")
+    p.add_argument("--no-repeat", action="store_true",
+                   help="--backing-only only: play the baked progression ONCE and stop, "
+                        "instead of looping forever. For hearing the backing without the "
+                        "loop-point crossfade/repeat.")
+    p.add_argument("--crossfade", action="store_true",
+                   help="bake the backing WITH equal-power crossfades at chord changes, "
+                        "long-chord repeats, and the loop point. Default is hard butt-splices "
+                        "(seams sounded cleaner than the crossfade's smearing).")
+    p.add_argument("--generation-debug", action="store_true",
+                   help="debug mode (implies --backing-only): play each RAW generated clip "
+                        "(one per chord span, exactly as the model produced it -- no tiling/"
+                        "splicing/looping) ONCE, with 1s of silence between, then stop. For "
+                        "hearing what the model actually generated per chord.")
     args = p.parse_args()
+    if args.generation_debug:
+        args.backing_only = True
+    if args.no_repeat and not args.backing_only:
+        p.error("--no-repeat only applies with --backing-only")
 
     print(f"Loading {args.size} from exported .mlxfn (no download)...")
     mrt = MagentaRT2SystemMlxfn(size=args.size)
 
     bpb = _beats_per_bar(args.time_sig)
+
+    # Backing bake params, computed up front (they don't depend on the progression) so the
+    # progressive single-chord VAMP bake (Stage B, baked mid-learning) can use them too.
+    # "Let the model breathe" knobs scoped to the BACKING bake only (the drum bake reads the
+    # untouched args.* -> None -> model defaults). An explicit CLI flag still wins.
+    band_prompt = prompt_with_tempo(args.prompt, args.tempo, args.time_sig)
+    bk_style = args.style_strength if args.style_strength is not None else BACKING_CFG_MUSICCOCA
+    bk_notes = args.cfg_notes if args.cfg_notes is not None else BACKING_CFG_NOTES
+    bk_temp = args.temperature if args.temperature is not None else BACKING_TEMPERATURE
+    bk_topk = args.top_k if args.top_k is not None else BACKING_TOP_K
+
     import sounddevice as sd
 
     # --backing-only: ISOLATE the backing stage. No DI input, no count-in, no live
@@ -1144,6 +1713,16 @@ def main():
         # Backing SOLO: no drum loop is baked here -- we play just the pitched backing so
         # the harmony is heard naked. The player is configured below from the backing
         # buffer's own sample rate (Stage 3). `loop` is None: no drum layer.
+        # EXCEPTION: --generation-debug also bakes the drum loop so its raw phrase can be
+        # auditioned alongside the per-chord backing clips (prepended to the clip list).
+        drum_clip = None
+        if args.generation_debug:
+            print(f"Baking {args.loop_bars}-bar drum loop (once)...")
+            _ds, _dsr, _dch, _doff, drum_take = make_drum_loop(
+                mrt, args.tempo, args.time_sig, args.loop_bars,
+                cfg_musiccoca=args.style_strength, temperature=args.temperature,
+                top_k=args.top_k, return_clip=True)
+            drum_clip = ("drums", args.loop_bars * bpb, drum_take)
         loop = None
         player = None
     else:
@@ -1214,11 +1793,40 @@ def main():
         else:
             capture.start()
 
+        # PROGRESSIVE learning (three stages):
+        #  A: drums only (count-in + initial listening) -- the learner thread is the clock+ears.
+        #  B: the instant bar 1's root is heard, bake a one-chord VAMP on THIS (main) thread
+        #     and hand it to the learner, which layers it under the drums while STILL listening.
+        #  C: when the loop locks, the learner keeps drums+vamp alive while we bake the full
+        #     backing here, then we enter the full band at the top of the progression (below).
+        # MLX stays on the main thread; the learner is copy-only (push + read-only snapshot).
+        loop = DrumLoopFeeder(samples, beat_offsets, bpb)
+        learner = ProgressionLearner(
+            loop, capture, args.tempo, args.time_sig, player,
+            count_in_bars=args.count_in_bars, beats_per_bar=bpb,
+            backing_gain=args.backing_gain)
+        learner.start()
         try:
-            loop = DrumLoopFeeder(samples, beat_offsets, bpb)
-            progression, key = learn_progression(
-                loop, capture, args.tempo, args.time_sig, args.learn_bars,
-                player, count_in_bars=args.count_in_bars)
+            # Stage B (opt-in via --vamp): wait for the first chord, bake the single-chord
+            # vamp, install it. (Skip in --generation-debug: it auditions raw clips and
+            # returns; a vamp adds nothing.) Off by default -- many find the early single
+            # chord muddies things until the full progression locks.
+            if args.vamp and not args.generation_debug:
+                first_root, first_quality = learner.wait_first_chord()
+                vamp_prog = [{"start_beat": 0, "length_beats": bpb,
+                              "root": first_root, "quality": first_quality}]
+                print(f"Baking vamp on {chord_name(first_root, first_quality)} "
+                      f"(progressive: comes in while we keep listening)...")
+                v_samples, _v_sr, _v_ch, v_offsets = make_backing_loop(
+                    mrt, band_prompt, args.tempo, args.time_sig, vamp_prog, None,
+                    cfg_musiccoca=bk_style, cfg_notes=bk_notes,
+                    cfg_drums=args.cfg_drums, temperature=bk_temp, top_k=bk_topk,
+                    crossfade=args.crossfade)
+                learner.install_vamp(DrumLoopFeeder(v_samples, v_offsets, bpb))
+
+            # Stage C: block until the loop locks. The learner keeps drums+vamp going (and
+            # holds lock_beat internally for its assumed-position cue + enter-at-top).
+            progression, key, _lock_beat = learner.wait_locked()
         finally:
             if not args.duplex:
                 capture.stop()  # done listening; separate streams: free the input device
@@ -1228,37 +1836,46 @@ def main():
     # Stage 3: play the pitched backing that follows the captured progression under
     # continuous drums forever. Two backing modes:
     #  - stream (default): generate ONE BAR at a time off MRT2, carrying model state
-    # The backing is ALWAYS baked once up front (chord-run loop), then looped forever:
-    # make_backing_loop does one generate() per run of identical chords (state carried,
-    # crossfade-joined, seamless-wrapped), so playback only starts after every run is
-    # generated and a fixed buffer can't drift. Drums (when present) stay the fixed
-    # drums-only bed -- the non-drifting master clock.
-    band_prompt = prompt_with_tempo(args.prompt, args.tempo, args.time_sig)
+    # The backing is ALWAYS baked once up front (per-chord <=6s takes, looped), then
+    # looped forever: make_backing_loop does one generate() per chord change capped at
+    # ~6s (state carried, crossfade-joined, longer chords loop their take, seamless-
+    # wrapped), so playback only starts after every span is generated and a fixed buffer
+    # can't drift. Drums (when present) stay the fixed drums-only bed -- the master clock.
+    # band_prompt + bk_* were computed up front (the vamp bake needs them).
     total_beats = sum(s["length_beats"] for s in progression)
     _bars = bar_chords(progression, total_beats, bpb)
     prog_bars = len(_bars)
 
-    # "Let the model breathe" knobs, scoped to the BACKING bake only (the drum bake above
-    # keeps reading the untouched args.* -> None -> model defaults, so its sound is
-    # unchanged). An explicitly-passed CLI flag still wins over these defaults.
-    bk_style = args.style_strength if args.style_strength is not None else BACKING_CFG_MUSICCOCA
-    bk_notes = args.cfg_notes if args.cfg_notes is not None else BACKING_CFG_NOTES
-    bk_temp = args.temperature if args.temperature is not None else BACKING_TEMPERATURE
-    bk_topk = args.top_k if args.top_k is not None else BACKING_TOP_K
-
-    runs = chord_runs(progression, total_beats, bpb)
+    spans = chord_spans(progression, total_beats, bpb)
     print(f"Baking backing band over the progression ({prog_bars} bars, "
-          f"{len(runs)} chord-run(s))...")
-    # Keep the drums going on a background thread while this (main-thread, multi-second)
-    # bake runs, so the output never drops to silence between learning and play. In
-    # --backing-only there is no drum loop and the player isn't configured yet, so the
-    # bake just runs synchronously (silence-before-first-sound is fine there).
-    keepalive = DrumKeepAlive(loop, player) if not args.backing_only else None
-    with keepalive if keepalive is not None else contextlib.nullcontext():
-        b_samples, b_sr, b_ch, b_offsets = make_backing_loop(
-            mrt, band_prompt, args.tempo, args.time_sig, progression, key,
-            cfg_musiccoca=bk_style, cfg_notes=bk_notes,
-            cfg_drums=args.cfg_drums, temperature=bk_temp, top_k=bk_topk)
+          f"{len(spans)} chord change(s), <={BACKING_MAX_TAKE_SECONDS:.0f}s/take)...")
+    # The drums (+ the Stage-B vamp) keep sounding during this multi-second main-thread bake
+    # because the learner thread is STILL the clock -- it stays alive from listening through
+    # this bake to the top-of-progression entry below, printing the assumed live position each
+    # bar. (In --backing-only there is no learner/clock; the bake runs synchronously and
+    # silence-before-first-sound is fine.)
+    baked = make_backing_loop(
+        mrt, band_prompt, args.tempo, args.time_sig, progression, key,
+        cfg_musiccoca=bk_style, cfg_notes=bk_notes,
+        cfg_drums=args.cfg_drums, temperature=bk_temp, top_k=bk_topk,
+        crossfade=args.crossfade, return_clips=args.generation_debug)
+
+    if args.generation_debug:
+        b_samples, b_sr, b_ch, b_offsets, clips = baked
+        if drum_clip is not None:
+            clips = [drum_clip] + clips  # audition the raw drum phrase before the backing clips
+        player = QueuedPlayer(lead_seconds=args.lead_seconds,
+                              output_device=args.output_device, external=False)
+        label = (f"GENERATION DEBUG: raw drum loop + per-chord clips, {prog_bars}-bar progression "
+                 f"@ {args.tempo} BPM {args.time_sig}")
+        if not args.backing_only:
+            learner.stop()  # live generation-debug ran the learner as the clock; stop it
+        play_clips_with_silence(clips, b_sr, b_ch, label, player)
+        if duplex is not None:
+            duplex.close()
+        return
+
+    b_samples, b_sr, b_ch, b_offsets = baked
     backing = DrumLoopFeeder(b_samples, b_offsets, bpb)  # generic beat-slice feeder
 
     if args.backing_only:
@@ -1269,15 +1886,27 @@ def main():
         band = BackingSoloFeeder(backing, progression, total_beats, bpb,
                                  backing_gain=args.backing_gain)
         label = (f"Backing SOLO (no drums): {prog_bars}-bar progression "
-                 f"@ {args.tempo} BPM {args.time_sig} (baked chord-run loop)")
+                 f"@ {args.tempo} BPM {args.time_sig} (baked per-chord <=6s takes)")
     else:
+        # Enter in phase with the live player: the learner is STILL the clock (drums + the
+        # Stage-B vamp). Ask it to stop ON the next top-of-progression downbeat, so the vamp
+        # keeps sounding right up to the swap (no drums-only gap) and loop.i is left sitting on
+        # that downbeat -- the band's beat 0 (progression bar 1) then coincides with live bar 1.
+        print("Waiting for the top of the progression to enter...")
+        learner.enter_at_top()
+        learner.wait_for_top()
+        learner.stop()
         band = LayeredFeeder(loop, backing, progression, total_beats, bpb,
                              backing_gain=args.backing_gain, mode=args.mode)
+        band.beat = 0  # progression bar 1, aligned to the live bar 1 we waited for
         loop_bars = len(beat_offsets) // bpb
         label = (f"Band: {loop_bars}-bar drum loop under a {prog_bars}-bar progression "
-                 f"@ {args.tempo} BPM {args.time_sig} (baked chord-run backing)")
+                 f"@ {args.tempo} BPM {args.time_sig} (baked per-chord <=6s backing)")
     try:
-        play_band_forever(band, label, player)
+        if args.backing_only and args.no_repeat:
+            play_band_once(band, label + " [play once, no repeat]", player)
+        else:
+            play_band_forever(band, label, player)
     finally:
         if duplex is not None:
             duplex.close()
