@@ -707,32 +707,61 @@ def _beat_chroma(capture, bpm, min_seconds=1.6):
     return basic_pitch_histogram(snap, capture.sr, capture._note_threshold)
 
 
+def _bar_root(chroma12):
+    """Strongest-correlating root pitch-class for a whole bar's summed chroma,
+    quality ignored. Returns int 0..11, or None if the bar was silent."""
+    import numpy as np
+
+    c = np.asarray(chroma12, dtype=np.float64)
+    c = c - c.mean()
+    if not float(np.linalg.norm(c)):
+        return None
+    templates = chord_templates()
+    root, _q = max(templates, key=lambda k: float((c * templates[k]).sum()))
+    return root
+
+
+def _detect_repeat(roots):
+    """Return loop length L (>=2) if `roots` is exactly two back-to-back copies of
+    its first L bars AND that L-bar block contains >=1 root change; else None.
+    Requires an even count: L = len(roots)//2, first half must equal second half."""
+    n = len(roots)
+    if n < 4 or n % 2:                 # need >=2 bars per cycle, 2 cycles => >=4 bars
+        return None
+    L = n // 2
+    if roots[:L] != roots[L:]:
+        return None
+    if len(set(roots[:L])) < 2:        # enforce "one root change" inside the loop
+        return None
+    return L
+
+
 def learn_progression(loop, capture, bpm, time_sig, learn_bars,
                       player, count_in_bars=4):
-    """Run the count-in + N-bar capture over the FIXED drum loop, then locally
-    match a chord progression.
+    """Run the count-in over the FIXED drum loop, then ADAPTIVELY detect the
+    progression loop -- no fixed length.
 
     Drums are replayed beat-by-beat from the baked loop (`loop`, a DrumLoopFeeder)
     -- no model calls here, so the groove is steady. The player is already sounding
     the loop. While drums play we snapshot the input ring buffer per beat and
-    accumulate a per-beat chroma table; after the capture window we match each beat
-    to a chord, estimate the stable key over the whole window, and merge adjacent
-    identical chords into segments.
+    accumulate one root per bar (root only; quality ignored). After each completed
+    bar we test whether the root sequence-since-start is two back-to-back copies of
+    itself (a confirmed loop, >=2 bars, with at least one root change). The first
+    cycle IS the progression; we lock it and stop listening. There is no upper
+    bound -- a held single chord never locks, so we keep listening until a real
+    loop is played.
+
+    `learn_bars` is DEPRECATED/ignored (length is now open-ended); kept in the
+    signature so the --learn-bars CLI flag doesn't break.
 
     Returns (progression, key) where progression is a list of
       {"start_beat", "length_beats", "root", "quality"}
     and key is (root, mode). Beats are indexed from the first captured beat (0).
-
-    Deferred upgrade (Sonnet labeling): the per-beat (pitch-classes, chroma) table
-    built here is exactly the payload an LLM call would receive. Swapping the local
-    match_chord/merge step for an API call is the only change needed -- the capture
-    and the table stay put.
     """
     import numpy as np
 
     bpb = _beats_per_bar(time_sig)
-    captured_beats = []   # (pitch_class_set, chroma12) per captured beat
-    learn_total = learn_bars * bpb
+    captured_beats = []   # (pitch_class_set, chroma12) per captured beat -- feeds estimate_key
 
     # Pace beat-pushes to roughly real time: the loop is only `loop_bars` long, so
     # if we pushed every beat at once we'd race ahead of the player and capture the
@@ -751,41 +780,52 @@ def learn_progression(loop, capture, bpm, time_sig, learn_bars,
             print(f"intro bar {played // bpb + 1}/{count_in_bars}")
         push_beat()
 
-    # Phase 2 -- capture N bars, one logical beat at a time.
-    print(f"LEARNING bar 1/{learn_bars}")
+    # Phase 2 -- listen open-endedly, one root per bar, until a loop repeats.
+    print("LISTENING for the loop (play it through twice)...")
+    bar_chroma = np.zeros(12)   # accumulates the current bar's per-beat chroma
+    roots = []                  # one root pitch-class (or None) per completed bar
+    loop_len = None
     while True:
-        if captured_beats and len(captured_beats) % bpb == 0:
-            print(f"LEARNING bar {len(captured_beats) // bpb + 1}/{learn_bars}")
         push_beat()
         hist = _beat_chroma(capture, bpm)
         pcs = {p for p in range(12) if hist[p] > 0}
         captured_beats.append((pcs, np.asarray(hist, dtype=np.float64)))
-        if len(captured_beats) >= learn_total:
+        bar_chroma = bar_chroma + hist
+        if len(captured_beats) % bpb:
+            continue  # mid-bar
+
+        # Bar just completed -- decide its root. Carry the previous root through a
+        # silent bar so a quiet gap doesn't break the loop; skip leading silence.
+        r = _bar_root(bar_chroma)
+        bar_chroma = np.zeros(12)
+        if r is None and roots:
+            r = roots[-1]
+        if r is None:
+            print("bar -: silent (waiting for first chord)")
+            continue
+        roots.append(r)
+        bar_idx = len(roots)
+
+        # Live feedback: the root just heard + the running sequence forming.
+        seq = " ".join(NOTE_NAMES[x] for x in roots)
+        print(f"bar {bar_idx}: heard {NOTE_NAMES[r]}   [{seq}]")
+
+        loop_len = _detect_repeat(roots)
+        if loop_len is not None:
+            roots = roots[:loop_len]   # the first cycle IS the progression
             break
 
-    # --- Match + merge ----------------------------------------------------
-    templates = chord_templates()
-    # Stable key over the whole window: sum all per-beat chroma, estimate once.
+    print(f"[locked] {loop_len}-bar loop: " + " ".join(NOTE_NAMES[x] for x in roots))
+
+    # --- Build progression from the locked roots --------------------------
+    # Stable key over everything heard: sum all per-beat chroma, estimate once.
     total_chroma = np.sum([c for _, c in captured_beats], axis=0)
     key = estimate_key(total_chroma, modal_margin=capture._modal_margin)
 
-    per_beat = []
-    for pcs, chroma in captured_beats:
-        per_beat.append(match_chord(chroma, templates))  # may be None if silent
-
-    # Carry the last seen chord through silent beats so a gap doesn't split a chord.
-    last = None
-    filled = []
-    for ch in per_beat:
-        if ch is None:
-            ch = last
-        last = ch
-        filled.append(ch)
-    # If the whole window was silent, fall back to the tonic triad of the key.
-    if all(ch is None for ch in filled):
-        kr, km = key
-        quality = "min" if MODE_ALIASES.get(km, km) == "aeolian" else "maj"
-        filled = [(kr, quality)] * len(filled)
+    # Root-only downstream, so pick a single quality from the key for the labels.
+    kr, km = key
+    quality = "min" if MODE_ALIASES.get(km, km) == "aeolian" else "maj"
+    filled = [(r, quality) for r in roots for _ in range(bpb)]  # beat-level
 
     # Merge adjacent identical chords into segments.
     progression = []
@@ -797,7 +837,6 @@ def learn_progression(loop, capture, bpm, time_sig, learn_bars,
             progression.append({"start_beat": i, "length_beats": 1,
                                  "root": ch[0], "quality": ch[1]})
 
-    kr, km = key
     print(f"\n[key] {NOTE_NAMES[kr]} {mode_name(km)}")
     print("[progression] " + " | ".join(
         f"{chord_name(s['root'], s['quality'])}x{s['length_beats']}" for s in progression))
@@ -1029,7 +1068,8 @@ def main():
                    help="time signature (drives backbeat grid + soft prompt hint)")
     p.add_argument("--size", default="mrt2_base")
     p.add_argument("--learn-bars", type=int, default=16,
-                   help="bars of live input to capture for the progression")
+                   help="DEPRECATED/ignored: learning is now adaptive (listens "
+                        "until the played loop repeats)")
     p.add_argument("--count-in-bars", type=int, default=4,
                    help="bars of drums-only intro before learning starts")
     p.add_argument("--loop-bars", type=int, default=4,
@@ -1141,7 +1181,7 @@ def main():
         # backing; the drum loop is baked from its own drums-only prompt (drum_prompt),
         # so the band words don't leak pitched instruments into the bare drum bed.
         print(f"DI input {capture.name!r} @ {capture.sr} Hz, channel {args.input_channel}; "
-              f"{args.count_in_bars}-bar intro, then learning {args.learn_bars} bars.")
+              f"{args.count_in_bars}-bar intro, then listening until the loop repeats.")
 
         # Bake the fixed drum loop ONCE, up front. Everything after (count-in, learning,
         # final playback) replays this exact buffer -- the model is never asked for drums

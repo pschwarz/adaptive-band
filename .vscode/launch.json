@@ -20,7 +20,7 @@
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}",
       "python": "${workspaceFolder}/.venv/bin/python",
-      "args": ["--prompt", "indie ballad backing track", "--tempo", "70", "--time-sig", "4/4", "--learn-bars", "10", "--input-device", "iD4", "--input-channel", "1", "--output-device", "iD4", "--duplex", "--temperature", "1.25"]
+      "args": ["--prompt", "80's rock backing track", "--tempo", "70", "--time-sig", "4/4", "--learn-bars", "10", "--input-device", "iD4", "--input-channel", "1", "--output-device", "iD4", "--duplex", "--temperature", "1.25"]
     },
     {
       "name": "hello_world (blues 4/4)",
