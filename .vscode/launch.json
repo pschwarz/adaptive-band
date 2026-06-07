@@ -3,6 +3,26 @@
   "configurations": [
 
     {
+      "name": "staged_band (backing-only, --chords)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/staged_band.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "args": ["--backing-only", "--prompt", "indie ballad backing track", "--tempo", "60", "--time-sig", "4/4", "--chords", "C, C, C, D, D, C, C", "--temperature", "1.25"]
+    },
+    {
+      "name": "staged_band (baked drum loop)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/staged_band.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "args": ["--prompt", "indie ballad backing track", "--tempo", "70", "--time-sig", "4/4", "--learn-bars", "10", "--input-device", "iD4", "--input-channel", "1", "--output-device", "iD4", "--duplex", "--temperature", "1.25"]
+    },
+    {
       "name": "hello_world (blues 4/4)",
       "type": "debugpy",
       "request": "launch",

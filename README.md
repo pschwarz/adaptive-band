@@ -150,3 +150,118 @@ you can dial the window in diagnostically before running the full stream.
 We run basic-pitch via its **bundled ONNX model** (vendored at `models/nmp.onnx`, 228 KB)
 through `onnxruntime` — *not* the `basic-pitch` pip package, which pulls in TensorFlow and
 pins `numpy<2` and so breaks MRT2/MLX (which needs numpy 2). Only `onnxruntime` is added.
+
+## Staged backing band (`staged_band.py`)
+
+A different interaction model from `hello_world.py`'s continuous open-loop stream. The band
+runs in stages and follows a **chord progression** you play, rather than just tracking a key:
+
+1. **Drums + tempo** — a fixed drum loop is **baked once** (`--loop-bars`, default 4) and
+   then **replayed** for the whole session; it never drops out and never drifts.
+2. **Learning stage** — after a count-in (`--count-in-bars`, default 4), it listens to your
+   directly-wired (DI) instrument for `--learn-bars` bars (default 16) and captures the chord
+   progression you play.
+3. **Loop** — it bakes a pitched backing over the captured progression, then loops it
+   **summed with the drums** forever under Ctrl+C, with the detected key/progression printed.
+
+```bash
+uv run python staged_band.py --prompt "jazz trio, piano" --tempo 100 --time-sig 4/4 \
+    --input-device iD4 --output-device "External Headphones"
+```
+
+Console output walks the stages: `Baking 4-bar drum loop…`, `count-in…`, `intro bar 1/4 … 4/4`,
+`LEARNING bar 1/16 … 16/16`, then the detected `[key]` and `[progression]`, then
+`Baking backing band over the progression…`, then the looping band (drums + backing).
+
+**Why a baked loop.** MRT2 composes percussion *fresh on every `generate()` call*, so streaming
+drums beat-by-beat makes the groove wander and drift. Instead we ask the model for a short
+drum-only passage **once** (`make_drum_loop`, `--loop-bars` bars), keep the resulting samples,
+and **replay that exact buffer** (`DrumLoopFeeder`) for the count-in, the learning stage, and the
+forever-loop. No model calls after baking — the beat is rock-steady and identical every bar.
+
+**Drums-only.** The bake does *not* use the band prompt. MRT2's only real lever is the text
+style, and with `notes=None` alone a band prompt (e.g. "indie rock ballad") still renders the
+full kit-plus-band — piano/bass/guitar leak into the bed. So the loop is embedded from a
+dedicated, emphatic drums-only style (`drum_prompt`: "solo drum kit, drums only … no bass, no
+guitar, no piano … isolated drum track") with the tempo/time-sig hint appended. The band prompt
+is kept only for the deferred chord-following backing.
+
+**Seamless wrap.** Baked beat-by-beat with `state` carried forward, the buffer's end never
+anticipates jumping back to sample 0, so a raw wrap pops once per loop. The bake generates **one
+extra bar past the loop** (a lead-out — the model's natural continuation) and equal-power
+crossfades it back over the loop's head (`_crossfade_wrap`), splicing the loop's end onto its
+start with matching energy. The crossfade touches only the first beat, so the per-beat offsets
+stay exact.
+
+**Following chords.** After learning, a pitched backing is **baked once** over the captured
+progression (`make_backing_loop`) and looped **summed with the drums** (`LayeredFeeder`). MRT2 has
+no symbolic chord input. What shapes the sound:
+
+- **Chord-run granularity, state carried.** Consecutive bars on the same chord are collapsed
+  into one **run** (`chord_runs`), and each run is **one `generate()` call** with MRT `state`
+  carried run→run. A 2-bar held C is generated in one shot (the model phrases across the whole
+  held chord) rather than restarting each bar; carrying state keeps the next run continuous with
+  the last. Run→run seams are equal-power crossfaded (`_crossfade_join`), and the loop point is
+  folded with a lead-out run (`_crossfade_wrap`) — click-free.
+- **Root-only detection.** The backing only cares about each chord's **root**. Quality is
+  normalized to major in `chord_runs`, so a G major → G minor change is ignored (both sent as
+  plain "G") and same-root bars merge regardless of quality. This deliberately smooths the
+  backing for consistency — the kept harmony is just the run's root.
+- **Root in the prompt + a single-pitch notes mask.** The run's prompt names the root
+  (`bar_prompt` → `"<band prompt>, current chord: G major"`) and `notes = root_hint_mask(root)`
+  marks the **one** root pitch class (`on=3`). The old graded chord+key mask (`chord_mask`,
+  kept for reference) sounded bad; a lone root hint is a gentle cage, not a chord voicing.
+- **"Breathe" knobs, backing-only.** The backing bake runs with loosened conditioning so it
+  doesn't lock rigidly to the hint — `cfg_musiccoca=0.1`, `cfg_notes=1.0`, `temperature=1.0`,
+  `top_k=103` (the `BACKING_*` constants). These apply to the **backing bake only**; the drum
+  bake keeps model defaults. Any explicit CLI flag (`--style-strength`, `--cfg-notes`,
+  `--temperature`, `--top-k`) overrides the backing default.
+- **`drums=0` (off) on the backing, not `None`.** MRT2's `drums` conditioning is one int —
+  `-1` masked / `0` off / `1` on — and `None` means *masked* = "model's choice", so the backing
+  layer was composing its **own** kit that clashed with the drum bed. The backing is baked with
+  `drums=0` (pushed by `--cfg-drums`, default 3) so it's strictly pitched.
+
+The drums (the bed) and the backing wrap at their own lengths and are mixed per beat
+(`--backing-gain`, soft-limited so the sum can't clip). The drum↔chord phase rotates as the two
+loops wrap independently — accepted.
+
+**No silence during the bake.** The backing bake is multi-second and runs on the main thread.
+To avoid dropping to silence between learning and play, a background thread (`DrumKeepAlive`)
+keeps pushing the baked drum loop into the player's queue while the bake runs, then stops and
+joins cleanly before the real feeder takes over (copy-only, no MLX off the main thread).
+
+**Iterate the backing without a guitar.** `--backing-only` skips the DI input, count-in, and
+learning entirely: it takes the progression from `--chords` (comma-separated, one bar each, e.g.
+`--chords "Am, F, C, G"`) and plays the baked backing **solo** (no drums). For tuning the
+backing generation on its own — only needs an output device.
+
+**Live debug hotkeys.** During the final loop: **`d`** = drums only, **`b`** = backing only,
+**`m`** = mixed (default; set the initial layer with `--mode`), **`q`** = quit. The chord of each
+bar is printed as it starts (`bar 3: Am`).
+
+**Chord detection (v1).** Fully local, no network: each captured beat's pitches (via the
+basic-pitch ONNX front-end) are matched against 48 triad templates (maj/min/dim/aug × 12
+roots), adjacent identical beats are merged into segments, and the key is estimated once over
+the whole window. The per-beat note table is built so it can later be sent to an LLM (Sonnet)
+for richer labeling (sevenths, inversions) by swapping only the matching step.
+
+`staged_band.py` does **not** modify `hello_world.py` — it imports its beat grid, input
+capture, pitch front-end, key estimator, and device resolvers.
+
+**Device routing.** Two options:
+- **`--duplex`** (convenient) — input and output share **one device** (e.g. the iD4) on a single
+  full-duplex `sd.Stream`. This is safe because it's *one* PortAudio client on *one* clock: the
+  `-10863` collision only happens with two *separate* streams on a device, and there's nothing to
+  drift against with a single clock. The interface defaults to 44.1k but MRT2 is 48k, so the
+  stream opens at 48k and the input analysis rate is realigned to match. One cable, no rerouting.
+- **separate devices** (default) — distinct input and output devices, two streams. Same-device is
+  still rejected here (two streams collide); pass `--duplex` or route output elsewhere.
+
+Args: `--prompt`, `--tempo`, `--time-sig`, `--size`, `--loop-bars`, `--count-in-bars`,
+`--learn-bars`, `--input-device`, `--output-device`, `--duplex`, `--input-channel`, `--rms-gate`,
+`--modal-margin`, `--note-threshold`, `--key-strength` (now unused), `--style-strength`,
+`--cfg-notes`, `--temperature`, `--top-k`, `--lead-seconds`, `--backing-gain`, `--cfg-drums`,
+`--mode`, `--backing-only`, `--chords`.
+
+Future directions (not yet built): continuous re-learning (regenerate the backing when a new
+progression is detected) and gesture cues (a camera "nod" → switch progression for verse/chorus).
