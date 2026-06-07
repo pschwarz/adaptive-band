@@ -3,6 +3,8 @@
 Experiments with [Magenta RealTime 2](https://magenta.withgoogle.com/magenta-realtime-2)
 (MRT2) — Google's open-weights live music model — running natively on Apple Silicon via MLX.
 
+This is a very initial draft towards an idea about collaborating musically, and live with a live audio AI model. Just like with coding agents you trade ideas back and forth in turns, this opens up the idea of turns when collaborating with the AI in playing music.
+
 https://github.com/user-attachments/assets/8eae8ccf-4250-49fe-9105-f2ee7c5d2a2a
 
 The video shows:
@@ -12,6 +14,10 @@ The video shows:
 * It feeds this chord pattern and the prompt into magenta to produce a backing track.
 * Once the backing track is generated, the system waits for the next time the chord progression starts.
 * The system comes in with the full backing track.
+
+Future ideas:
+* Obviously, improve the fidelity of the backing track.
+* Incorporate feedback from the user while playing. This could be via visual cues captured by camera, where a head nod couple be a cue to further expand on a good track, or a head shake would be to retry generation, try for a better track.
 
 
 ## Setup
