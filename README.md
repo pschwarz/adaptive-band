@@ -3,6 +3,8 @@
 Experiments with [Magenta RealTime 2](https://magenta.withgoogle.com/magenta-realtime-2)
 (MRT2) — Google's open-weights live music model — running natively on Apple Silicon via MLX.
 
+Developed as part of the [Music Technology Hackathon, Boston, June 6-7 2026](https://musichackspace.org/events/hackathon-boston-june-2026)
+
 This is a very initial draft towards an idea about collaborating musically, and live with a live audio AI model. Just like with coding agents you trade ideas back and forth in turns, this opens up the idea of turns when collaborating with the AI in playing music.
 
 https://github.com/user-attachments/assets/8eae8ccf-4250-49fe-9105-f2ee7c5d2a2a
