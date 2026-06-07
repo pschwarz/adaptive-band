@@ -5,6 +5,14 @@ Experiments with [Magenta RealTime 2](https://magenta.withgoogle.com/magenta-rea
 
 https://github.com/user-attachments/assets/8eae8ccf-4250-49fe-9105-f2ee7c5d2a2a
 
+The video shows:
+* Running the `staged_band.py` app. We input the tempo, time signature and prompt to use later for the magenta-generated backing track
+* You first hear the magenta-generated drum track that follows the provided tempo and time signature
+* Next you hear a live bass track (please excuse my rough bass playing 😉) The app listens just for root notes of the chords. It listens for a chord change and a repeating pattern.
+* It feeds this chord pattern and the prompt into magenta to produce a backing track.
+* Once the backing track is generated, the system waits for the next time the chord progression starts.
+* The system comes in with the full backing track.
+
 
 ## Setup
 
