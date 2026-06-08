@@ -7,7 +7,8 @@ Developed as part of the [Music Technology Hackathon, Boston, June 6-7 2026](htt
 
 This is a very initial draft towards an idea about collaborating musically, and live with a live audio AI model. Just like with coding agents you trade ideas back and forth in turns, this opens up the idea of turns when collaborating with the AI in playing music.
 
-https://github.com/user-attachments/assets/8eae8ccf-4250-49fe-9105-f2ee7c5d2a2a
+[![Adaptive Band](https://img.youtube.com/vi/zy3mPp5n00E/0.jpg)](https://www.youtube.com/watch?v=zy3mPp5n00E)
+
 
 The video shows:
 * Running the `staged_band.py` app. We input the tempo, time signature and prompt to use later for the magenta-generated backing track
